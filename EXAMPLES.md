@@ -40,6 +40,7 @@ computing and sleeping:
 - [A one-shot report from a script](#a-one-shot-report-from-a-script)
 - [Is a hung program stuck in atomic mode?](#is-a-hung-program-stuck-in-atomic-mode)
 - [A poor man's profiler](#a-poor-mans-profiler)
+- [Profile with perf](#profile-with-perf)
 - [Which Racket code calls a C function?](#which-racket-code-calls-a-c-function)
 - [Break in C only when a given Racket procedure is the caller](#break-in-c-only-when-a-given-racket-procedure-is-the-caller)
 - [Break in C only in atomic mode](#break-in-c-only-in-atomic-mode)
@@ -173,7 +174,40 @@ for about a second, so this suits a program that runs steadily, and more
 samples give better numbers. To see callers, print more of the stack
 (`chez-stack 3`) and count whole stacks instead of single names.
 
-## Which Racket code calls a C function?
+## Profile with perf
+
+For a statistical profile without stopping the program, record with
+`perf` and then name the Racket code with `chez_perf_map.py`. With
+`work.rkt` running:
+
+```
+$ perf record -F 999 -o perf.data -p $PID -- sleep 5
+$ ./chez_perf_map.py $PID
+wrote 24581 code objects to /tmp/perf-320848.map (layout from .../equates.h)
+$ perf report -i perf.data --stdio --sort dso,sym
+    43.77%  [JIT] tid 320848  [.] count-primes
+    26.74%  [JIT] tid 320848  [.] fib
+    25.37%  [JIT] tid 320848  [.] remainder
+     1.36%  [JIT] tid 320848  [.] exact-integer-sqrt
+     1.07%  [JIT] tid 320848  [.] integer-sqrt
+     0.74%  [JIT] tid 320848  [.] check-range-generic
+     0.07%  [unknown]         [k] 0xffffffff8c8b976d
+     0.04%  racket            [.] pthread_getspecific@plt
+```
+
+Without the map, every Racket line shows a bare address such as
+`[JIT] tid 320848 [.] 0x0000000041c49521`.
+
+Unlike the gdb sampler, perf attributes time to the procedure that is
+running, not to its callers: `count-primes`'s inner loop was inlined into
+it, so the loop's time shows under `count-primes`, and `remainder` is
+separate because it is a primitive. perf cannot record Racket call
+stacks; with `-g`, the stacks stop after a frame or two and are wrong past
+the first.
+
+If gdb is already attached, `chez-perf-map` writes the same file.
+
+
 
 Set an ordinary breakpoint on the C function, and read `bt`:
 

@@ -19,6 +19,9 @@ Load it with `source chez_gdb.py`. It adds:
     chez-atomic         Racket's `current-atomic` for the selected thread
     chez-break NAME     set a breakpoint at the entry of every code object
                         named NAME
+    chez-perf-map [PATH] write a perf symbol map (by default
+                        /tmp/perf-PID.map) naming every code object;
+                        needs chez_perf_map.py next to this file
 
   Convenience functions, for breakpoint conditions and the like:
     $chez_name(ADDR)            name of the code object containing ADDR
@@ -69,6 +72,10 @@ import re
 import gdb
 from gdb.FrameDecorator import FrameDecorator
 from gdb.unwinder import FrameId, Unwinder, register_unwinder
+
+# gdb defines __file__ only while it sources this file, so note where the
+# file is now, for finding chez_perf_map.py later.
+_HERE = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 
 # ----------------------------------------------------------------------
 # Layout
@@ -762,6 +769,40 @@ chez_gdb.py."""
             gdb.Breakpoint("*%#x" % (p + layout().code_data_disp))
 
 
+class ChezPerfMap(gdb.Command):
+    """Write a perf symbol map naming every Chez code object: chez-perf-map [PATH]
+
+By default the map goes to /tmp/perf-PID.map, where `perf report` looks for
+it. Add --unique to keep code objects with the same name apart."""
+
+    def __init__(self):
+        super().__init__("chez-perf-map", gdb.COMMAND_DATA, gdb.COMPLETE_FILENAME)
+
+    def invoke(self, arg, from_tty):
+        import sys
+        if _HERE not in sys.path:
+            sys.path.insert(0, _HERE)
+        try:
+            import chez_perf_map
+        except ImportError:
+            raise gdb.GdbError("chez-perf-map needs chez_perf_map.py in %s" % _HERE)
+        words = arg.split()
+        unique = "--unique" in words
+        paths = [w for w in words if w != "--unique"]
+        pid = _inf().pid
+        path = os.path.expanduser(paths[0]) if paths else "/tmp/perf-%d.map" % pid
+
+        def read(addr, n):
+            try:
+                return _inf().read_memory(addr, n).tobytes()
+            except gdb.MemoryError:
+                return None
+
+        entries = list(chez_perf_map.find_code_objects(read, _mappings(), layout()))
+        chez_perf_map.write_perf_map(path, entries, unique)
+        print("wrote %d code objects to %s" % (len(entries), path))
+
+
 # ----------------------------------------------------------------------
 # Convenience functions
 
@@ -809,5 +850,5 @@ class ChezCallerIsFn(gdb.Function):
 register_unwinder(None, ChezUnwinder(), replace=True)
 ChezFrameFilter()
 for cls in (ChezLayout, ChezWhere, ChezStack, ChezName, ChezAtomic, ChezBreak,
-            ChezNameFn, ChezAtomicFn, ChezCallerIsFn):
+            ChezPerfMap, ChezNameFn, ChezAtomicFn, ChezCallerIsFn):
     cls()

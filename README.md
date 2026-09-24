@@ -27,9 +27,12 @@ teaches gdb to walk Chez Scheme stacks and to name the code in them:
 
 It also adds commands for inspecting Racket's state, convenience functions
 for breakpoint conditions, and a way to set breakpoints on Racket
-procedures by name. [EXAMPLES.md](EXAMPLES.md) has recipes for common
-tasks: finding what a running or hung program is doing, sampling it,
-seeing which Racket code calls a C function, and catching crashes.
+procedures by name. `chez_perf_map.py` does the same naming for `perf`,
+so that profiles of Racket programs name Racket code; see
+[Profiling with perf](#profiling-with-perf). [EXAMPLES.md](EXAMPLES.md)
+has recipes for common tasks: finding what a running or hung program is
+doing, sampling it, seeing which Racket code calls a C function, catching
+crashes, and profiling.
 
 ## Contents
 
@@ -42,6 +45,7 @@ seeing which Racket code calls a C function, and catching crashes.
 - [Breaking on Racket procedures](#breaking-on-racket-procedures)
 - [Breaking on C functions and seeing the Racket caller](#breaking-on-c-functions-and-seeing-the-racket-caller)
 - [Catching crashes](#catching-crashes)
+- [Profiling with perf](#profiling-with-perf)
 - [Reading the names](#reading-the-names)
 - [Layout](#layout)
 - [How it works](#how-it-works)
@@ -248,6 +252,12 @@ that Racket makes of procedures with keyword or optional arguments. See
 [Breaking on Racket procedures](#breaking-on-racket-procedures) for which
 calls such a breakpoint sees.
 
+### `chez-perf-map [--unique] [PATH]`
+
+Writes a perf symbol map naming every Chez code object in the process, by
+default to `/tmp/perf-PID.map`. It needs `chez_perf_map.py` in the same
+directory as `chez_gdb.py`. See [Profiling with perf](#profiling-with-perf).
+
 ### `chez-layout [PATH]`
 
 Without an argument, says where the layout constants came from. With a
@@ -370,6 +380,51 @@ continues as it would have after gdb records the state.
 To catch a fault that happens only occasionally, start many copies
 through `allow-ptrace` and attach such a gdb to each as soon as it
 starts. The gdb costs almost nothing until a signal arrives.
+
+## Profiling with perf
+
+`perf` cannot name Chez's machine code either: samples in Racket code
+appear as bare addresses under `[JIT]`. For such code, `perf report` reads
+`/tmp/perf-PID.map`, whose lines give the start, size and name of each
+piece of code. `chez_perf_map.py` writes that file by scanning the
+process for Chez code objects:
+
+```
+perf record -F 999 -p PID -- sleep 10
+./chez_perf_map.py PID
+perf report
+```
+
+```
+    43.77%  [JIT] tid 320848  [.] count-primes
+    26.74%  [JIT] tid 320848  [.] fib
+    25.37%  [JIT] tid 320848  [.] remainder
+     1.36%  [JIT] tid 320848  [.] exact-integer-sqrt
+     1.07%  [JIT] tid 320848  [.] integer-sqrt
+```
+
+Write the map after recording and while the program is still running.
+The collector can move code compiled after startup, and the map records
+where each code object is when the map is written. The Racket core never
+moves, so its names are always right. The map lasts after the program
+exits, so `perf report` can run later.
+
+The script reads the process's memory through `/proc/PID/mem`, which
+needs the same permission as attaching a debugger (see `allow-ptrace`).
+Inside gdb, `chez-perf-map` writes the same file through gdb, which also
+works while the process is stopped. With `--unique`, each name gets its
+code object's address, so code objects that share a name (`proc`, `#f`)
+stay apart in the report.
+
+Scanning takes a fraction of a second for a small program (0.14 seconds
+for 24,581 code objects).
+
+**Call graphs do not work.** `perf record -g` follows frame pointers, and
+Chez uses `%rbp` as an ordinary register, so the stacks it records stop
+after a frame or two and the frames after the first are wrong. DWARF
+unwinding (`--call-graph dwarf`) copies only the C stack, and Chez keeps
+Scheme frames on a separate stack in the heap. Use the flat profile, or
+sample stacks with gdb as in [EXAMPLES.md](EXAMPLES.md#a-poor-mans-profiler).
 
 ## Reading the names
 
@@ -496,6 +551,8 @@ that is a return address into a C function gdb can name.
 - **Core files.** The walk and the names work on a core file. The fallback
   that calls `pthread_getspecific` does not, since it runs code in the
   process.
+- **perf call graphs.** `chez_perf_map.py` names samples, but perf cannot
+  walk Scheme stacks; see [Profiling with perf](#profiling-with-perf).
 
 ## Example: a hang in DrRacket's tests
 
