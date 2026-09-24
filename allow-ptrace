@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Run a command so that any process of the same user may attach to it
+with ptrace, even under Yama's ptrace_scope=1.
+
+  allow-ptrace racket my-program.rkt
+
+With ptrace_scope=1, only an ancestor can attach to a process, so a gdb
+started later cannot attach to a racket that is already running. This
+wrapper calls prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) and then execs
+the command; the setting survives exec, and the process is not traced
+until a debugger attaches.
+"""
+
+import ctypes
+import os
+import sys
+
+PR_SET_PTRACER = 0x59616D61
+PR_SET_PTRACER_ANY = 2**64 - 1
+
+if len(sys.argv) < 2:
+    sys.exit(__doc__)
+ctypes.CDLL(None).prctl(PR_SET_PTRACER, ctypes.c_ulong(PR_SET_PTRACER_ANY), 0, 0, 0)
+os.execvp(sys.argv[1], sys.argv[1:])
