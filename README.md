@@ -143,9 +143,58 @@ backtrace continues through:
   prompt, and each holds the continuation to resume when the prompt's body
   returns. Frames such as `call-in-empty-metacontinuation-frame` mark these
   boundaries;
+- the C code between a callback and the Racket code that called C. When C
+  calls back into Racket, as GTK does for a signal handler, the callback's
+  Scheme frames go on the same Scheme stack as the Racket code that made
+  the C call, but the C frames in between are on the C stack. The
+  backtrace goes from the callback's frames to `S_call_help` and the
+  callback's entry code, shown as `[scheme] <foreign-callable entry>`,
+  then through the C frames, and back to the Racket code that made the
+  call;
 - and finally back into the C code that entered Scheme, such as
   `S_call_help` and `racket_boot` on the main thread or `start_thread` on
   another OS thread.
+
+For example, stopped at a collection inside a racket/gui callback:
+
+```
+#7  0x00000000425a9b1a in [scheme] collect-and-scribble ()
+#8  0x00000000425aae52 in [scheme] call-as-atomic-callback ()
+#9  0x00000000425af835 in [scheme] #f ()
+#10 0x000000004a009e81 in [scheme] #f ()
+#11 0x000000004a009fa4 in [scheme] #f ()
+#12 0x0000555555576d3a in S_call_help ()
+#13 0x0000000049e11026 in [scheme] <foreign-callable entry> ()
+#14 0x00007ffff6d3c68c in g_closure_invoke () at /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0
+...
+#18 0x00007ffff6d5ce83 in g_signal_emit () at /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0
+#19 0x00007ffff5b78fd6 in gtk_widget_size_allocate_with_baseline () at /usr/lib/x86_64-linux-gnu/libgtk-3.so.0
+...
+#35 0x00007ffff5b77a60 in gtk_widget_realize () at /usr/lib/x86_64-linux-gnu/libgtk-3.so.0
+...
+#44 0x0000000048c0b707 in [scheme] p ()
+#45 0x00000000425b21f1 in [scheme] proc ()
+#46 0x000000004a1f31d1 in [scheme] [...e/wx/gtk/canvas.rkt:276:3 ()
+```
+
+Because the C frames are there, gdb's `$_any_caller_matches` and Python
+code that walks `frame.older()` see them too, so a breakpoint can stop
+only when some C function is among the callers. For example, to stop at a
+collection only when it happens inside a GTK signal handler:
+
+```
+python
+class GCInSignal(gdb.Breakpoint):
+    def stop(self):
+        f = gdb.newest_frame()
+        while f is not None:
+            if f.name() == "g_signal_emit":
+                return True
+            f = f.older()
+        return False
+GCInSignal("S_do_gc")
+end
+```
 
 The stack is per OS thread. Racket's green threads are not OS threads: a
 Racket thread that is not running has its continuation saved in its

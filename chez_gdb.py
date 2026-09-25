@@ -54,6 +54,15 @@ metacontinuation frame per prompt, each holding the continuation to
 resume; those continue the stack. This follows S_continuation_depth in
 Chez's c/schsig.c.
 
+Callbacks. When C calls back into Racket, the callback's Scheme frames go
+on the Scheme stack right above the frame of the Scheme code that made the
+C call, while the C frames in between are on the C stack. The unwinder
+leaves the Scheme stack where a callback began (a frame whose caller
+position is a return point in Chez's `invoke` code, which S_call_help
+runs), unwinds the callback's entry code from the layout that
+asm-foreign-callable in Chez's s/x86_64.ss gives it, and lets gdb unwind
+the C frames back to the Scheme code that made the call.
+
 Breakpoints on Racket procedures sit at a code object's entry, which runs
 for calls through the procedure's closure: calls to primitives from other
 code, calls across modules, and calls through variables or higher-order
@@ -190,6 +199,7 @@ _unwind_state = {}  # (pc, frame base) -> segment state, for the unwinder
 
 def _clear_caches(*_):
     _code_ranges.clear()
+    _callable_frames.clear()
     _unwind_state.clear()
 
 
@@ -329,6 +339,34 @@ def is_shot(k):
     continuation."""
     L = layout()
     return s64(k + L.continuation_stack_length_disp) == L.scaled_shot_1_shot_flag
+
+
+# The prologue of a foreign callable's entry code on x86_64 Linux, from
+# asm-foreign-callable in Chez's s/x86_64.ss: `sub $N,%rsp`, then push
+# RBX, RBP, R12, R13, R14, R15. The C return address is then at rsp+N+48.
+_CALLABLE_PUSHES = bytes([0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57])
+# where the entry code saved each register, relative to its rsp
+CALLABLE_SAVED = (("r15", 0), ("r14", 8), ("r13", 16), ("r12", 24), ("rbp", 32), ("rbx", 40))
+_callable_frames = {}  # code object -> frame size in bytes, or None
+
+
+def callable_frame_size(code):
+    """For the entry code of a foreign callable (C calling Racket), the
+    bytes between its rsp and the return address into C; None for other
+    code objects."""
+    if code in _callable_frames:
+        return _callable_frames[code]
+    size = None
+    try:
+        b = _inf().read_memory(code + layout().code_data_disp, 17).tobytes()
+        if b[0:3] == b"\x48\x81\xec" and b[7:17] == _CALLABLE_PUSHES:    # sub $imm32,%rsp
+            size = int.from_bytes(b[3:7], "little") + 48
+        elif b[0:3] == b"\x48\x83\xec" and b[4:14] == _CALLABLE_PUSHES:  # sub $imm8,%rsp
+            size = b[3] + 48
+    except gdb.MemoryError:
+        pass
+    _callable_frames[code] = size
+    return size
 
 
 # ----------------------------------------------------------------------
@@ -501,7 +539,18 @@ class ChezUnwinder(Unwinder):
     frame base and thread context; its frame id pairs that stack pointer
     with the code object's entry and, to tell recursive frames apart, the
     frame base. After the last Scheme frame, unwinding resumes in C at the
-    first word above the stack pointer that is a return address into C."""
+    first word above the stack pointer that is a return address into C.
+
+    A callback from C into Racket pushes its Scheme frames onto the same
+    Scheme stack as the Racket code that called C, so walking the Scheme
+    stack alone would skip the C frames in between. C enters Scheme through
+    a foreign callable's entry code, which calls S_call_help, which runs
+    Chez's `invoke` code on the frame of the Scheme procedure that made the
+    C call. So when a frame's caller position is a return point in
+    `invoke`, the unwinder returns to S_call_help instead; gdb unwinds that
+    in C, the entry code is unwound from its fixed layout (restoring the
+    registers it saved), and the C frames above it lead back to the Scheme
+    code that made the call, with %r13 and %r14 as they were then."""
 
     def __init__(self):
         super().__init__("chez")
@@ -518,8 +567,22 @@ class ChezUnwinder(Unwinder):
         code = code_from_pc(pc)
         if code is None:
             return None
-        sfp = int(pending.read_register(REG_SFP))
         rsp = int(pending.read_register("rsp"))
+        L = layout()
+        pc_type = pending.read_register("pc").type
+        reg_type = pending.read_register("rsp").type
+
+        size = callable_frame_size(code)
+        if size is not None:
+            # a foreign callable's entry code, which C called
+            info = pending.create_unwind_info(FrameId(rsp, code + L.code_data_disp))
+            info.add_saved_register("pc", gdb.Value(u64(rsp + size)).cast(pc_type))
+            info.add_saved_register("rsp", gdb.Value(rsp + size + 8).cast(reg_type))
+            for reg, off in CALLABLE_SAVED:
+                info.add_saved_register(reg, gdb.Value(u64(rsp + off)).cast(reg_type))
+            return info
+
+        sfp = int(pending.read_register(REG_SFP))
         state = _unwind_state.get((pc, sfp))
         if state is None:
             tc = int(pending.read_register(REG_TC))
@@ -530,11 +593,12 @@ class ChezUnwinder(Unwinder):
             tc, pos = state
         caller = caller_position(tc, pos)
 
-        L = layout()
         info = pending.create_unwind_info(FrameId(rsp, code + L.code_data_disp, sfp))
-        pc_type = pending.read_register("pc").type
-        reg_type = pending.read_register("rsp").type
-        if caller is not None:
+        ret_at = None
+        if caller is not None and code_name(code_from_pc(caller[0])) == "invoke":
+            # the frame that C entered Scheme with: its caller is S_call_help
+            ret_at = self._c_return(rsp, "S_call_help")
+        if caller is not None and ret_at is None:
             cpc, cbase, _ = caller
             _unwind_state[(cpc, cbase)] = (tc, caller)
             info.add_saved_register("pc", gdb.Value(cpc).cast(pc_type))
@@ -542,7 +606,8 @@ class ChezUnwinder(Unwinder):
             info.add_saved_register(REG_SFP, gdb.Value(cbase).cast(reg_type))
             info.add_saved_register(REG_TC, gdb.Value(tc).cast(reg_type))
         else:
-            ret_at = self._c_return(rsp)
+            if ret_at is None:
+                ret_at = self._c_return(rsp)
             if ret_at is None:
                 info.add_saved_register("pc", gdb.Value(0).cast(pc_type))
                 info.add_saved_register("rsp", gdb.Value(rsp).cast(reg_type))
@@ -552,15 +617,19 @@ class ChezUnwinder(Unwinder):
         return info
 
     @staticmethod
-    def _c_return(rsp, limit=4096):
+    def _c_return(rsp, function=None, limit=4096):
         """Where the return address into the C code that entered Scheme is:
-        the first word above rsp inside a C function gdb can name. This is
-        a heuristic; a stale code pointer above rsp would mislead it."""
+        the first word above rsp that points into the code of a C function
+        gdb can name (or, given `function`, into that function). This is a
+        heuristic; a stale code pointer above rsp would mislead it."""
         _, data = _read_block(rsp, rsp + limit)
         for i in range(0, len(data) - 7, 8):
             v = int.from_bytes(data[i:i + 8], "little")
-            if is_c_address(v) and _c_symbol(v):
-                return rsp + i
+            if is_c_address(v):
+                s = _c_symbol(v)
+                if s and " in section .text" in s and (
+                        function is None or s.split(" ")[0] == function):
+                    return rsp + i
         return None
 
 
@@ -580,6 +649,8 @@ class ChezFrameDecorator(FrameDecorator):
         except gdb.MemoryError:
             code = None
         if code is not None:
+            if callable_frame_size(code) is not None:
+                return "[scheme] <foreign-callable entry>"
             return "[scheme] %s" % code_name(code)
         return super().function()
 
