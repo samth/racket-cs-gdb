@@ -1,0 +1,13 @@
+#!/bin/sh
+#|
+# Exec the real binary, since rackup's PATH shim waits for its child and
+# cannot forward a signal sent only to this launcher's PID.
+if command -v rackup >/dev/null 2>&1; then
+    racket_binary=$(rackup which racket) || exit "$?"
+    exec "$racket_binary" "$0" "$@"
+fi
+exec racket "$0" "$@"
+|#
+#lang racket/base
+(require "../private/perf.rkt")
+(exit (main #:standalone? #t))

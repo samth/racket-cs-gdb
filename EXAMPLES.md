@@ -176,6 +176,21 @@ samples give better numbers. To see callers, print more of the stack
 
 ## Profile with perf
 
+To launch and record `work.rkt` in one command, stopping it after five seconds:
+
+```
+rackup run local-plt -- raco racket-perf --duration 5 -o work-profile work.rkt
+```
+
+The command prints the hottest procedures and saves the full text report,
+recording, Scheme map, log, and run metadata in `work-profile/`. It uses
+the Racket executable running `raco`, starts recording before running the program,
+and captures the map before exit or interrupt. Use `--unique` to separate
+code objects sharing a name, `--equates PATH` for an explicit layout,
+`-F N`/`-e EVENT` for sampling settings, and `--interactive` to open perf's
+report UI afterward. A finite script can omit `--duration`; Ctrl-C also saves
+the recording. See [Profiling with perf](README.md#profiling-with-perf).
+
 For a statistical profile without stopping the program, record with
 `perf` and then name the Racket code with `chez_perf_map.py`. With
 `work.rkt` running:

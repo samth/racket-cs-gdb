@@ -12,7 +12,7 @@ Racket code show up under their Chez names (such as `remainder` or
 
 Typical use:
 
-  perf record -F 999 -g -p PID -- sleep 10
+  perf record -F 999 -p PID -- sleep 10
   chez_perf_map.py PID
   perf report
 
@@ -77,9 +77,11 @@ def read_equates(path, names=DEFAULT_LAYOUT):
 def equates_for_executable(exe):
     """equates.h in the build tree around a racket executable, or None."""
     bindir = os.path.dirname(os.path.realpath(exe))
-    path = os.path.join(bindir, "..", "src", "build", "cs", "c", "ChezScheme",
-                        "boot", "ta6le", "equates.h")
-    return path if os.path.exists(path) else None
+    for root in (bindir, os.path.join(bindir, "..", "src", "build", "cs", "c")):
+        path = os.path.join(root, "ChezScheme", "boot", "ta6le", "equates.h")
+        if os.path.exists(path):
+            return path
+    return None
 
 
 class Layout:
@@ -164,6 +166,10 @@ def write_perf_map(path, entries, unique=False):
         for start, size, name in sorted(entries):
             if unique:
                 name = "%s [%#x]" % (name, start)
+            elif len(name) <= 2:
+                # perf's map loader ignores names of at most two bytes.
+                # Keep short Chez names (#f, p, <, +, ...) visible.
+                name = "[%s]" % name
             f.write("%x %x %s\n" % (start, size, name.replace("\n", " ")))
 
 
@@ -195,6 +201,7 @@ def proc_reader(pid):
             return None
         return data if data is not None and len(data) == n else None
 
+    read.close = mem.close
     return read
 
 

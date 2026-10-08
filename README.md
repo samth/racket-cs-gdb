@@ -27,8 +27,8 @@ teaches gdb to walk Chez Scheme stacks and to name the code in them:
 
 It also adds commands for inspecting Racket's state, convenience functions
 for breakpoint conditions, and a way to set breakpoints on Racket
-procedures by name. `chez_perf_map.py` does the same naming for `perf`,
-so that profiles of Racket programs name Racket code; see
+procedures by name. `raco racket-perf` runs a program and produces a named
+profile with perf; see
 [Profiling with perf](#profiling-with-perf). [EXAMPLES.md](EXAMPLES.md)
 has recipes for common tasks: finding what a running or hung program is
 doing, sampling it, seeing which Racket code calls a C function, catching
@@ -432,6 +432,81 @@ starts. The gdb costs almost nothing until a signal arrives.
 
 ## Profiling with perf
 
+The profiler is a separate package in [`racket-perf/`](racket-perf/).
+Its [manual source](racket-perf/scribblings/racket-perf.scrbl) documents the
+command and profiling limits. Install that subdirectory once:
+
+```
+raco pkg install --auto --link /path/to/racket-cs-gdb/racket-perf
+```
+
+To install into a specific rackup toolchain, run that installation command
+through `rackup run TOOLCHAIN --`. Then run a program and get a profile:
+
+```
+raco racket-perf my-program.rkt arg1 arg2
+```
+
+With a specific rackup toolchain:
+
+```
+rackup run local-plt -- raco racket-perf -o my-profile my-program.rkt arg1 arg2
+```
+
+The command profiles the Racket executable running `raco`, preserving its
+package environment. `--racket PATH` selects an explicit executable instead.
+The standalone `./racket-perf/bin/racket-perf` launcher remains available
+from a checkout; it resolves the current rackup toolchain, or uses `PATH` when rackup is absent.
+Both entry points start perf before letting Racket run, capture Scheme symbols
+before exit, and print the hottest 20 procedures with sample
+counts and percentages. Program output and arguments pass through normally,
+including a script's `module+ main`. Put wrapper options before the script;
+use `--` before Racket flags such as `-e` or `-l`.
+
+```
+# Bound a long-running program, with distinct names for each code object:
+raco racket-perf --duration 10 --unique -o my-profile my-program.rkt
+
+# Run a Racket command instead of a script:
+raco racket-perf --duration 10 -- -l drracket
+
+# Choose sampling parameters, layout, and an interactive report:
+raco racket-perf -F 499 -e cycles:u --equates /path/to/ta6le/equates.h \
+    --interactive my-program.rkt
+```
+
+Each run creates a new result directory (timestamped by default), containing
+`perf.data`, the complete `report.txt`, `perf-PID.map`, `perf.log`, and
+`run.json` with the command, sampling settings, layout, timing, and exit status.
+Existing result directories are not overwritten. `--rows N` controls how many
+rows print in the terminal; the saved report includes all entries.
+
+The map is also published as `/tmp/perf-PID.map`, so you can reopen the result:
+
+```
+perf report -i my-profile/perf.data
+```
+
+If that temporary map has been removed, copy the saved `perf-PID.map` back to
+`/tmp` before reopening the recording. The text report remains readable
+without any temporary files.
+
+Both profiling entry points are implemented in Racket and need no Python.
+They require x86_64 Linux, Racket CS, and perf with its `--control` interface.
+Linux must permit perf recording and tracing your own child process. It uses ptrace at exec, signals, and exit, without stepping
+through instructions; no `allow-ptrace` launcher is needed. Ctrl-C saves the
+profile and forwards the interrupt to Racket. `--duration` sends SIGTERM
+when the recording time expires; a process that fails to exit is killed after
+three seconds. A duration-limited recording returns success, while an ordinary
+run returns Racket's exit status. It profiles the main Racket process and its
+OS threads; separate subprocesses do not get their own Scheme maps.
+
+The final map describes code at capture time. Code moved or collected during
+the run can leave earlier samples unnamed or inaccurately named; startup
+samples are included. The wrapper does not provide Scheme call graphs.
+
+For a process you have already started, the existing map-only workflow remains:
+
 `perf` cannot name Chez's machine code either: samples in Racket code
 appear as bare addresses under `[JIT]`. For such code, `perf report` reads
 `/tmp/perf-PID.map`, whose lines give the start, size and name of each
@@ -464,6 +539,10 @@ Inside gdb, `chez-perf-map` writes the same file through gdb, which also
 works while the process is stopped. With `--unique`, each name gets its
 code object's address, so code objects that share a name (`proc`, `#f`)
 stay apart in the report.
+
+Names of one or two characters are bracketed (`p` becomes `[p]`, `#f` becomes
+`[#f]`) because [perf's map loader](https://github.com/torvalds/linux/blob/master/tools/perf/util/symbol.c)
+skips such short names. `--unique` already makes those names long enough.
 
 Scanning takes a fraction of a second for a small program (0.14 seconds
 for 24,581 code objects).
