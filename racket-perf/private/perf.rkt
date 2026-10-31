@@ -4,15 +4,54 @@
 (provide main)
 (define-runtime-path exec-helper "perf-exec.rkt")
 (define (now) (/ (current-inexact-monotonic-milliseconds) 1000.0))
+
+;; Chez's underflow return point, which a frame-pointer walk reports at
+;; each continuation (stack segment) boundary in place of the real caller;
+;; in Racket CS these come from prompts and from thread (engine) swaps
+(define boundary-frames '("winder-dummy"))
+
+;; Write call chains as folded stacks (outermost first, `;`-separated, then
+;; a sample count), the input format of flame-graph tools such as
+;; flamegraph.pl, speedscope, and inferno.
+(define (write-folded-stacks data-path out)
+  (define-values (proc stdout stdin stderr)
+    (subprocess #f #f (current-error-port) (find-executable-path "perf")
+                "script" "-i" data-path "-F" "comm,ip,sym"))
+  (close-output-port stdin)
+  (define counts (make-hash))
+  (define (frame-name line)
+    ;; "\t  44f4083e fib+0x7b (/tmp/perf-1.map)" or "... [unknown] (...)"
+    (define m (regexp-match #px"^\\s*([0-9a-f]+)\\s+(.*?)(?:\\+0x[0-9a-f]+)?(?:\\s+\\(.*\\))?$" line))
+    (and m (if (equal? (caddr m) "[unknown]") (string-append "0x" (cadr m)) (caddr m))))
+  (define (flush! comm frames)
+    ;; frames are outermost first. A frame-pointer walk is reliable only up to
+    ;; the first continuation boundary; past it, the chain can run into memory
+    ;; that a reinstated continuation no longer uses. Cut the stack there.
+    (when comm
+      (define inner-first (reverse frames))
+      (define kept (takef inner-first (lambda (n) (not (member n boundary-frames)))))
+      (define cut? (< (length kept) (length inner-first)))
+      (define key (string-join (append (list comm) (if cut? '("[continuation]") '()) (reverse kept)) ";"))
+      (hash-update! counts key add1 0)))
+  (let loop ([comm #f] [frames '()])
+    (define line (read-line stdout 'any))
+    (cond [(eof-object? line) (flush! comm frames)]
+          [(string=? (string-trim line) "") (flush! comm frames) (loop #f '())]
+          [(not comm) (loop (car (string-split line)) '())]
+          [else (loop comm (let ([n (frame-name line)]) (if n (cons n frames) frames)))]))
+  (close-input-port stdout)
+  (subprocess-wait proc)
+  (for ([k (sort (hash-keys counts) string<?)])
+    (fprintf out "~a ~a\n" k (hash-ref counts k))))
 (define (this-racket)
   (path->string (simplify-path (find-executable-path (find-system-path 'exec-file)) #t)))
 
 (define (parse-options argv)
   (define options (make-hash '((frequency . 999) (event . "cpu-clock:u") (rows . 20)
                               (unique . #f) (interactive . #f) (duration . #f)
-                              (equates . #f) (output . #f) (racket . #f))))
+                              (equates . #f) (output . #f) (racket . #f) (call-graph . #f))))
   (define (help)
-    (display "usage: raco racket-perf [options] script [arguments ...]\n\nRun Racket CS, record a flat perf profile, and print named hot procedures.\n\n  --racket PATH       Racket executable (default: Racket running this command)\n  -o, --output DIR    New result directory (default: timestamped directory)\n  -F, --frequency N   Samples/second (default: 999)\n  -e, --event EVENT   Perf event (default: cpu-clock:u)\n  --duration SECONDS  Stop the program after this many seconds\n  --equates PATH      Matching Chez ta6le equates.h\n  --unique            Append code-object addresses to Scheme names\n  --interactive       Open perf's interactive report after saving the text report\n  --rows N            Hot procedures printed (default: 20; full report saved)\n  -h, --help          Show this help\n\nUse -- before Racket flags. For a toolchain: rackup run ID -- raco racket-perf ...\n")
+    (display "usage: raco racket-perf [options] script [arguments ...]\n\nRun Racket CS, record a flat perf profile, and print named hot procedures.\n\n  --racket PATH       Racket executable (default: Racket running this command)\n  -o, --output DIR    New result directory (default: timestamped directory)\n  -F, --frequency N   Samples/second (default: 999)\n  -e, --event EVENT   Perf event (default: cpu-clock:u)\n  --duration SECONDS  Stop the program after this many seconds\n  --equates PATH      Matching Chez ta6le equates.h\n  --unique            Append code-object addresses to Scheme names\n  -g, --call-graph    Record call chains by frame pointers (needs a Racket\n                      whose Chez keeps a frame-pointer chain); saves callgraph.txt\n  --interactive       Open perf's interactive report after saving the text report\n  --rows N            Hot procedures printed (default: 20; full report saved)\n  -h, --help          Show this help\n\nUse -- before Racket flags. For a toolchain: rackup run ID -- raco racket-perf ...\n")
     (values #f '()))
   (let loop ([args argv])
     (cond [(and (pair? args) (regexp-match #px"^(--[^=]+)=(.*)$" (car args)))
@@ -22,6 +61,9 @@
           [(null? args) (values options '())]
           [(equal? (car args) "--") (values options (cdr args))]
           [(member (car args) '("--help" "-h")) (help)]
+          [(member (car args) '("--call-graph" "-g"))
+           (hash-set! options 'call-graph #t)
+           (loop (cdr args))]
           [(member (car args) '("--unique" "--interactive"))
            (hash-set! options (if (equal? (car args) "--unique") 'unique 'interactive) #t)
            (loop (cdr args))]
@@ -119,10 +161,12 @@
        (set! log (open-output-file (build-path output "perf.log")))
        (define-values (proc stdout stdin stderr)
          (parameterize ([subprocess-group-enabled #t])
-           (subprocess log (current-input-port) log (find-executable-path "perf")
+           (apply subprocess log (current-input-port) log (find-executable-path "perf")
                        "record" "-e" (opt 'event) "-F" (number->string (opt 'frequency))
+                       (append (if (opt 'call-graph) '("--call-graph=fp") '())
+                               (list
                        "-o" (path->string (build-path output "perf.data")) "-p" (number->string pid)
-                       "--delay=-1" (format "--control=fifo:~a,~a" control-path ack-path))))
+                       "--delay=-1" (format "--control=fifo:~a,~a" control-path ack-path))))))
        (set! perf proc)
        (control perf writer reader "enable")
        (set! start (now))
@@ -243,14 +287,30 @@
              (unless (parameterize ([current-output-port out])
                        (system* (find-executable-path "perf") "report" "-i"
                                 (path->string (build-path output "perf.data")) "--stdio"
-                                "--stdio-color=never" "--no-children" "--sort=dso,symbol" "-n" "--percent-limit=0"))
+                                "--stdio-color=never" "--no-children" "--sort=dso,symbol" "-n" "--percent-limit=0"
+                                "-g" "none"))
                (error 'perf "report failed"))))
+         (when (hash-ref options 'call-graph)
+           ;; inclusive time per procedure, each with the call chains leading to it
+           (call-with-output-file (build-path output "callgraph.txt")
+             (lambda (out)
+               (unless (parameterize ([current-output-port out])
+                         (system* (find-executable-path "perf") "report" "-i"
+                                  (path->string (build-path output "perf.data")) "--stdio"
+                                  "--stdio-color=never" "--children" "--sort=symbol" "-n"
+                                  "--percent-limit=1" "-g" "graph,0.5,caller"))
+                 (error 'perf "call-graph report failed"))))
+           (call-with-output-file (build-path output "stacks.folded")
+             (lambda (out) (write-folded-stacks (path->string (build-path output "perf.data")) out))))
          (let loop ([lines (file->lines report-path)] [rows 0])
            (unless (null? lines)
              (define next (+ rows (if (regexp-match? #px"^\\s*\\d.*%" (car lines)) 1 0)))
              (if (> next (hash-ref options 'rows))
                  (displayln "... full profile in report.txt")
                  (begin (displayln (car lines)) (loop (cdr lines) next)))))
+         (when (hash-ref options 'call-graph)
+           (eprintf "Call graph in ~a; folded stacks for flame graphs in ~a\n"
+                    (build-path output "callgraph.txt") (build-path output "stacks.folded")))
          (eprintf "Saved recording, report, map, and metadata in ~a\n" output)
          (unless (eq? (hash-ref metadata 'map_error) 'null)
            (error 'racket-perf "could not capture Scheme symbols: ~a" (hash-ref metadata 'map_error)))

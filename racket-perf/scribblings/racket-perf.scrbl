@@ -80,6 +80,14 @@ interrupt. A short program can therefore still produce a Scheme map.
        constants. Otherwise the profiler searches the build tree around the
        target executable, then falls back to built-in values for CS 9.3.0.8.
        Use a matching file when profiling another object layout.}
+ @item{@tt{-g}, @tt{--call-graph}: record call chains by following frame
+  pointers, and also save @tt{callgraph.txt} (inclusive time with callers) and
+  @tt{stacks.folded} (folded stacks for flame-graph tools). This needs a Racket
+  whose Chez Scheme keeps a frame-pointer chain in @tt{%rbp} (an experimental
+  x86_64 build option); with other builds, chains stop after a frame or two.
+  Folded stacks are cut at the first continuation boundary (a prompt or a
+  thread swap), shown as @tt{[continuation]}, because the chain past it is not
+  reliable.}
  @item{@tt{--unique}: append each code object's address to its Scheme name,
        keeping different objects with the same name separate in the report.}
  @item{@tt{--rows N}: print at most this many positive-integer report rows.
