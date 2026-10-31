@@ -1,7 +1,7 @@
 #lang info
 
 (define collection "racket-perf")
-(define deps '("base"))
+(define deps '("base" "profile-lib"))
 (define build-deps '("rackunit-lib" "scribble-lib" "racket-doc"))
 (define pkg-desc "Named Linux perf profiles for Racket CS programs")
 (define version "0.1")
