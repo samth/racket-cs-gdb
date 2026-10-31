@@ -1,4 +1,5 @@
-"""gdb support for debugging Racket CS (Chez Scheme) processes on x86_64 Linux.
+"""gdb support for debugging Racket CS (Chez Scheme) processes on x86_64 and
+arm64 (aarch64) Linux.
 
 Load it with `source chez_gdb.py`. It adds:
 
@@ -33,14 +34,15 @@ Load it with `source chez_gdb.py`. It adds:
     break gtk_clipboard_set_with_data if $chez_atomic() > 0
     chez-break sync-poll
 
-Layout. Object layouts come from Chez's equates.h for ta6le. By default
-the file is looked for at racket/src/build/cs/c/ChezScheme/boot/ta6le/
-equates.h relative to the racket binary (as in a build tree); otherwise
-built-in values checked against Racket CS 9.3.0.8 are used. Use
-`chez-layout PATH` to name a file explicitly; the pb/equates.h in the same
-tree is a different machine type and does not fit. Register assignments
-(%r14 thread context, %r13 Scheme frame pointer, %r15 closure) come from
-Chez's x86_64.ss for Linux and are fixed here.
+Layout. Object layouts come from Chez's equates.h for the machine type
+(ta6le on x86_64, tarm64le on arm64). By default the file is looked for at
+racket/src/build/cs/c/ChezScheme/boot/MACHINE/equates.h relative to the
+racket binary (as in a build tree); otherwise built-in values checked
+against Racket CS 9.3.0.8 are used. Use `chez-layout PATH` to name a file
+explicitly; the pb/equates.h in the same tree is a different machine type
+and does not fit. Register assignments come from Chez's x86_64.ss and
+arm64.ss for Linux and are fixed here: the thread context is in %r14 or
+x19, the Scheme frame pointer in %r13 or x20, the closure in %r15 or x26.
 
 Frames. Chez Scheme stacks grow toward higher addresses. The word at the
 base of a frame is the return address into its caller, and the caller's
@@ -60,8 +62,8 @@ C call, while the C frames in between are on the C stack. The unwinder
 leaves the Scheme stack where a callback began (a frame whose caller
 position is a return point in Chez's `invoke` code, which S_call_help
 runs), unwinds the callback's entry code from the layout that
-asm-foreign-callable in Chez's s/x86_64.ss gives it, and lets gdb unwind
-the C frames back to the Scheme code that made the call.
+asm-foreign-callable in Chez's s/x86_64.ss or s/arm64.ss gives it, and
+lets gdb unwind the C frames back to the Scheme code that made the call.
 
 Breakpoints on Racket procedures sit at a code object's entry, which runs
 for calls through the procedure's closure: calls to primitives from other
@@ -137,10 +139,53 @@ DEFAULT_LAYOUT = {
     "ptr_bytes": 0x8,
 }
 
-# x86_64 Linux register assignments, from Chez's s/x86_64.ss
-REG_TC = "r14"
-REG_SFP = "r13"
-REG_CP = "r15"
+# The thread context's fields sit 0x48 bytes further on arm64, which keeps
+# more machine registers in it; the rest of the layout is the same.
+# Checked against boot/tarm64le/equates.h for the same version.
+ARM64_LAYOUT = dict(DEFAULT_LAYOUT)
+for _k in ("tc_virtual_registers_disp", "tc_scheme_stack_disp", "tc_scheme_stack_size_disp",
+           "tc_stack_link_disp", "tc_sfp_disp", "tc_cp_disp", "tc_cchain_disp"):
+    ARM64_LAYOUT[_k] = DEFAULT_LAYOUT[_k] + 0x48
+
+# Register assignments for Linux, from Chez's s/x86_64.ss and s/arm64.ss:
+# (thread context, Scheme frame pointer, closure, C stack pointer)
+_REGS = {"x86_64": ("r14", "r13", "r15", "rsp"),
+         "aarch64": ("x19", "x20", "x26", "sp")}
+_MACHINE = {"x86_64": "ta6le", "aarch64": "tarm64le"}
+_arch = None
+
+
+def arch():
+    """"x86_64" or "aarch64", for the program being debugged. Found without
+    looking at frames, since the unwinder calls this."""
+    global _arch
+    if _arch is None:
+        name = None
+        try:
+            name = _inf().architecture().name()
+        except (AttributeError, gdb.error, RuntimeError):
+            try:
+                name = gdb.execute("show architecture", to_string=True)
+            except gdb.error:
+                name = ""
+        _arch = "aarch64" if "aarch64" in name else "x86_64"
+    return _arch
+
+
+def reg_tc():
+    return _REGS[arch()][0]
+
+
+def reg_sfp():
+    return _REGS[arch()][1]
+
+
+def reg_cp():
+    return _REGS[arch()][2]
+
+
+def reg_sp():
+    return _REGS[arch()][3]
 
 
 class Layout:
@@ -150,7 +195,7 @@ class Layout:
 
     @staticmethod
     def from_equates(path):
-        values = dict(DEFAULT_LAYOUT)
+        values = dict(ARM64_LAYOUT if arch() == "aarch64" else DEFAULT_LAYOUT)
         found = set()
         pattern = re.compile(r"#define\s+(\w+)\s+(?:\(ptr\))?(-?0x[0-9A-Fa-f]+|-?\d+)\s*$")
         with open(path) as f:
@@ -176,7 +221,7 @@ def _guess_equates():
         return None
     bindir = os.path.dirname(os.path.realpath(exe))
     path = os.path.join(bindir, "..", "src", "build", "cs", "c", "ChezScheme",
-                        "boot", "ta6le", "equates.h")
+                        "boot", _MACHINE[arch()], "equates.h")
     return path if os.path.exists(path) else None
 
 
@@ -185,7 +230,8 @@ def layout():
     if _layout is None:
         path = _guess_equates()
         _layout = (Layout.from_equates(path) if path
-                   else Layout(DEFAULT_LAYOUT, "built-in values for Racket CS 9.3.0.8"))
+                   else Layout(ARM64_LAYOUT if arch() == "aarch64" else DEFAULT_LAYOUT,
+                               "built-in %s values for Racket CS 9.3.0.8" % _MACHINE[arch()]))
     return _layout
 
 
@@ -207,8 +253,9 @@ def _clear_caches(*_):
 def _new_objfile(*_):
     """A new program may be a different Racket build: look for its layout
     again, unless one was named explicitly."""
-    global _layout
+    global _layout, _arch
     _clear_caches()
+    _arch = None
     if not _layout_explicit:
         _layout = None
 
@@ -348,26 +395,72 @@ def is_shot(k):
 _CALLABLE_PUSHES = bytes([0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57])
 # where the entry code saved each register, relative to its rsp
 CALLABLE_SAVED = (("r15", 0), ("r14", 8), ("r13", 16), ("r12", 24), ("rbp", 32), ("rbx", 40))
-_callable_frames = {}  # code object -> frame size in bytes, or None
+_callable_frames = {}  # code object -> callable frame, or None
 
 
-def callable_frame_size(code):
-    """For the entry code of a foreign callable (C calling Racket), the
-    bytes between its rsp and the return address into C; None for other
-    code objects."""
+def callable_frame(code):
+    """For the entry code of a foreign callable (C calling Racket), where
+    its frame keeps the C caller's state, as (offset of the return address
+    into C, offset of the caller's stack pointer, ((register, offset), ...)), all relative to the entry code's
+    stack pointer; None for other code objects."""
     if code in _callable_frames:
         return _callable_frames[code]
-    size = None
+    frame = None
     try:
-        b = _inf().read_memory(code + layout().code_data_disp, 17).tobytes()
-        if b[0:3] == b"\x48\x81\xec" and b[7:17] == _CALLABLE_PUSHES:    # sub $imm32,%rsp
-            size = int.from_bytes(b[3:7], "little") + 48
-        elif b[0:3] == b"\x48\x83\xec" and b[4:14] == _CALLABLE_PUSHES:  # sub $imm8,%rsp
-            size = b[3] + 48
+        if arch() == "aarch64":
+            frame = _arm64_callable_frame(code + layout().code_data_disp)
+        else:
+            b = _inf().read_memory(code + layout().code_data_disp, 17).tobytes()
+            size = None
+            if b[0:3] == b"\x48\x81\xec" and b[7:17] == _CALLABLE_PUSHES:    # sub $imm32,%rsp
+                size = int.from_bytes(b[3:7], "little") + 48
+            elif b[0:3] == b"\x48\x83\xec" and b[4:14] == _CALLABLE_PUSHES:  # sub $imm8,%rsp
+                size = b[3] + 48
+            if size is not None:
+                frame = (size, size + 8, CALLABLE_SAVED)
     except gdb.MemoryError:
         pass
-    _callable_frames[code] = size
-    return size
+    _callable_frames[code] = frame
+    return frame
+
+
+def _signed(v, bits):
+    return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
+
+def _arm64_callable_frame(entry, limit=24):
+    """The frame of a foreign callable's entry code on arm64 Linux, from
+    asm-foreign-callable in Chez's s/arm64.ss. The entry pushes the
+    argument registers, makes room for the activation state and returned
+    struct, and pushes lr, x19-x22 and the allocable callee-saved
+    registers, each push a pre-indexed `stp`/`str` on sp (16 bytes) or a
+    `sub sp, sp, #N`. Follow those pushes to the first other instruction;
+    it is a callable if one of them saved lr."""
+    w = _inf().read_memory(entry, 4 * limit).tobytes()
+    off = 0          # sp relative to the entry's sp
+    slots = {}       # register number -> offset relative to the entry's sp
+    for i in range(limit):
+        x = int.from_bytes(w[4 * i:4 * i + 4], "little")
+        if x & 0xFFC003E0 == 0xA98003E0:        # stp Xt, Xt2, [sp, #imm]!
+            off += _signed((x >> 15) & 0x7F, 7) * 8
+            slots[x & 31] = off
+            slots[(x >> 10) & 31] = off + 8
+        elif x & 0xFFE00FE0 == 0xF8000FE0:      # str Xt, [sp, #imm]!
+            off += _signed((x >> 12) & 0x1FF, 9)
+            slots[x & 31] = off
+        elif x & 0x7FC003E0 == 0x6D8003E0 or x & 0xFFC003E0 == 0xAD8003E0:
+            off += _signed((x >> 15) & 0x7F, 7) * (16 if x >> 30 == 2 else 8)  # stp Dt/Qt pre-index
+        elif x & 0xFFE00FE0 == 0xFC000FE0 or x & 0xFFE00FE0 == 0x3C800FE0:
+            off += _signed((x >> 12) & 0x1FF, 9)                              # str Dt/Qt pre-index
+        elif x & 0xFF8003FF == 0xD10003FF:      # sub sp, sp, #imm{, lsl 12}
+            off -= ((x >> 10) & 0xFFF) << (12 if x & (1 << 22) else 0)
+        else:
+            break
+    if 30 not in slots or off >= 0:
+        return None
+    saved = tuple(("x%d" % r, o - off) for r, o in sorted(slots.items())
+                  if 19 <= r <= 28 or r == 29)
+    return (slots[30] - off, -off, saved)
 
 
 # ----------------------------------------------------------------------
@@ -394,7 +487,7 @@ def tc_holds(tc, sfp):
 
 
 def frame_regs(frame):
-    return tuple(int(frame.read_register(r)) for r in ("pc", REG_SFP, REG_TC, REG_CP))
+    return tuple(int(frame.read_register(r)) for r in ("pc", reg_sfp(), reg_tc(), reg_cp()))
 
 
 def newest_scheme_frame(frame):
@@ -534,6 +627,18 @@ def stack_names(tc, pc, sfp, limit=100000):
 # ----------------------------------------------------------------------
 # Unwinder
 
+def _keep_c_registers(pending, info, exclude=()):
+    """Pass along the registers that Chez code never changes on arm64
+    (x27, x28, and the C frame pointer x29), so that gdb still has them
+    when it reaches C again; gdb takes a register an unwinder does not
+    mention as not saved."""
+    if arch() != "aarch64":
+        return
+    for reg in ("x27", "x28", "x29"):
+        if reg not in exclude:
+            info.add_saved_register(reg, pending.read_register(reg))
+
+
 class ChezUnwinder(Unwinder):
     """Unwinds Scheme frames. Each Scheme frame keeps the C stack pointer
     of the code that entered Scheme, and gets %r13 and %r14 set to its own
@@ -568,25 +673,28 @@ class ChezUnwinder(Unwinder):
         code = code_from_pc(pc)
         if code is None:
             return None
-        rsp = int(pending.read_register("rsp"))
+        SP = reg_sp()
+        rsp = int(pending.read_register(SP))
         L = layout()
         pc_type = pending.read_register("pc").type
-        reg_type = pending.read_register("rsp").type
+        reg_type = pending.read_register(SP).type
 
-        size = callable_frame_size(code)
-        if size is not None:
+        frame = callable_frame(code)
+        if frame is not None:
             # a foreign callable's entry code, which C called
+            pc_off, sp_off, saved = frame
             info = pending.create_unwind_info(FrameId(rsp, code + L.code_data_disp))
-            info.add_saved_register("pc", gdb.Value(u64(rsp + size)).cast(pc_type))
-            info.add_saved_register("rsp", gdb.Value(rsp + size + 8).cast(reg_type))
-            for reg, off in CALLABLE_SAVED:
+            info.add_saved_register("pc", gdb.Value(u64(rsp + pc_off)).cast(pc_type))
+            info.add_saved_register(SP, gdb.Value(rsp + sp_off).cast(reg_type))
+            for reg, off in saved:
                 info.add_saved_register(reg, gdb.Value(u64(rsp + off)).cast(reg_type))
+            _keep_c_registers(pending, info, [r for r, _ in saved])
             return info
 
-        sfp = int(pending.read_register(REG_SFP))
+        sfp = int(pending.read_register(reg_sfp()))
         state = _unwind_state.get((pc, sfp))
         if state is None:
-            tc = int(pending.read_register(REG_TC))
+            tc = int(pending.read_register(reg_tc()))
             if not tc_holds(tc, sfp):
                 return None
             pos = first_position(tc, pc, sfp)
@@ -595,29 +703,39 @@ class ChezUnwinder(Unwinder):
         caller = caller_position(tc, pos)
 
         info = pending.create_unwind_info(FrameId(rsp, code + L.code_data_disp, sfp))
-        ret_at = None
+        c_state = None
         if caller is not None and code_name(code_from_pc(caller[0])) == "invoke":
             # the frame that C entered Scheme with: its caller is S_call_help
-            ret_at = self._c_return(rsp, "S_call_help")
-        if caller is not None and ret_at is None:
+            c_state = self._c_entry(pending, tc, rsp, "S_call_help")
+        if caller is not None and c_state is None:
             cpc, cbase, _ = caller
             _unwind_state[(cpc, cbase)] = (tc, caller)
             info.add_saved_register("pc", gdb.Value(cpc).cast(pc_type))
-            info.add_saved_register("rsp", gdb.Value(rsp).cast(reg_type))
-            info.add_saved_register(REG_SFP, gdb.Value(cbase).cast(reg_type))
-            info.add_saved_register(REG_TC, gdb.Value(tc).cast(reg_type))
+            info.add_saved_register(SP, gdb.Value(rsp).cast(reg_type))
+            info.add_saved_register(reg_sfp(), gdb.Value(cbase).cast(reg_type))
+            info.add_saved_register(reg_tc(), gdb.Value(tc).cast(reg_type))
+            _keep_c_registers(pending, info)
         else:
-            if ret_at is None:
-                ret_at = self._c_return(rsp)
-            if ret_at is None:
-                info.add_saved_register("pc", gdb.Value(0).cast(pc_type))
-                info.add_saved_register("rsp", gdb.Value(rsp).cast(reg_type))
-            else:
-                info.add_saved_register("pc", gdb.Value(u64(ret_at)).cast(pc_type))
-                info.add_saved_register("rsp", gdb.Value(ret_at + 8).cast(reg_type))
-                for reg, value in c_entry_registers(tc, ret_at + 8):
-                    info.add_saved_register(reg, gdb.Value(value).cast(reg_type))
+            if c_state is None:
+                c_state = self._c_entry(pending, tc, rsp)
+            if c_state is None:
+                c_state = [("pc", 0), (SP, rsp)]
+            for reg, value in c_state:
+                info.add_saved_register(reg, gdb.Value(value).cast(pc_type if reg == "pc" else reg_type))
         return info
+
+    @classmethod
+    def _c_entry(cls, pending, tc, sp, function=None):
+        """The registers, as [(register, value)], of the C function that
+        entered Scheme (given `function`, S_call_help), whose stack pointer
+        Scheme code runs with; None if not found."""
+        if arch() == "aarch64":
+            return arm64_c_entry_registers(tc, sp, int(pending.read_register("x29")), function)
+        ret_at = cls._c_return(sp, function)
+        if ret_at is None:
+            return None
+        return ([("pc", u64(ret_at)), ("rsp", ret_at + 8)]
+                + c_entry_registers(tc, ret_at + 8))
 
     @staticmethod
     def _c_return(rsp, function=None, limit=4096):
@@ -683,6 +801,68 @@ def c_entry_registers(tc, sp):
     return []
 
 
+def _cchain_jmpbufs(tc):
+    """The jump buffers on tc's C chain, newest first."""
+    L = layout()
+    chain = u64(tc + L.tc_cchain_disp)
+    for _ in range(10000):
+        if chain & 7 != L.type_pair:
+            return
+        entry = u64(chain + L.pair_car_disp)
+        if entry & 7 == L.type_pair:
+            jb = u64(entry + L.pair_car_disp)
+            if jb:
+                yield jb
+        chain = u64(chain + L.pair_cdr_disp)
+
+
+def _in_function(addr, function):
+    s = _c_symbol(addr) if is_c_address(addr) else None
+    return s is not None and " in section .text" in s and (
+        function is None or s.split(" ")[0] == function)
+
+
+def _arm64_pointer_guard():
+    """glibc's pointer guard on arm64, which ld.so keeps in
+    __pointer_chk_guard; None if gdb cannot find it."""
+    try:
+        return int(gdb.parse_and_eval("*(unsigned long *)&__pointer_chk_guard"))
+    except gdb.error:
+        return None
+
+
+def arm64_c_entry_registers(tc, sp, fp, function=None):
+    """On arm64, the registers of the C function that entered Scheme with
+    stack pointer sp, from the glibc jmp_buf it set up (see
+    c_entry_registers). That jmp_buf holds x19-x28, x29, lr, and sp (at
+    words 0-9, 10, 11 and 13), with lr and sp xor-ed with the pointer
+    guard. The entry is the newest one whose lr decodes to a return
+    address in `function` and whose sp is at or above sp. Without the
+    guard's symbol, try the guard that makes the saved sp equal sp, for
+    Scheme code that runs on the stack pointer it was entered with. Without
+    a match, fall back to the frame record at fp (x29, which Chez code
+    leaves alone): that continues with the C function whose frame it is."""
+    function = function or "S_call_help"
+    guard = _arm64_pointer_guard()
+    try:
+        for jb in _cchain_jmpbufs(tc):
+            w = [u64(jb + 8 * i) for i in range(14)]
+            for g in ([guard] if guard is not None else []) + [w[13] ^ sp]:
+                lr, jsp = w[11] ^ g, w[13] ^ g
+                if jsp >= sp and _in_function(lr, function):
+                    return ([("pc", lr), ("sp", jsp), ("x29", w[10])]
+                            + [("x%d" % (19 + i), w[i]) for i in range(10)])
+    except gdb.MemoryError:
+        pass
+    try:
+        lr = u64(fp + 8)
+        if fp > sp and _in_function(lr, None):
+            return [("pc", lr), ("sp", fp + 16), ("x29", u64(fp))]
+    except gdb.MemoryError:
+        pass
+    return None
+
+
 def _c_symbol(addr):
     s = gdb.execute("info symbol %#x" % addr, to_string=True).strip()
     return None if s.startswith("No symbol") else s
@@ -699,7 +879,7 @@ class ChezFrameDecorator(FrameDecorator):
         except gdb.MemoryError:
             code = None
         if code is not None:
-            if callable_frame_size(code) is not None:
+            if callable_frame(code) is not None:
                 return "[scheme] <foreign-callable entry>"
             return "[scheme] %s" % code_name(code)
         return super().function()

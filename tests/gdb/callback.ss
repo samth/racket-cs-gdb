@@ -1,0 +1,16 @@
+;; For test_gdb.py: Scheme calls C, which calls back into Scheme, which
+;; calls C again; gdb stops there, in stop_here. Run as: scheme --script callback.ss LIB
+(load-shared-object (cadr (command-line)))
+(define call-it (foreign-procedure "call_it" (void* int) int))
+(define stop-here (foreign-procedure "stop_here" (int) int))
+(define (inner n)
+  (if (= n 0)
+      (stop-here 0)
+      (+ 1 (inner (- n 1)))))
+(define (in-callback x) (+ 1 (inner x)))
+(define callable (foreign-callable in-callback (int) int))
+(lock-object callable)
+(define (outer x)
+  (+ 1 (call-it (foreign-callable-entry-point callable) x)))
+(display (outer 5))
+(newline)

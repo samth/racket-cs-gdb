@@ -1,6 +1,6 @@
 # racket-cs-gdb
 
-gdb support for debugging Racket CS processes on x86_64 Linux.
+gdb support for debugging Racket CS processes on x86_64 and arm64 Linux.
 
 Racket CS runs on Chez Scheme, whose machine code has no symbols or unwind
 information that gdb understands. By default, a backtrace from inside Racket
@@ -55,7 +55,8 @@ crashes, and profiling.
 
 ## Requirements
 
-- x86_64 Linux. The register assignments are Chez's for that platform.
+- x86_64 or arm64 (aarch64) Linux. The register assignments are Chez's for
+  those platforms.
 - Racket CS. Racket BC is a different runtime and is not supported.
 - gdb 14 or later, built with Python (as Ubuntu's and Debian's are). The
   tool uses `gdb.unwinder.FrameId` and `Progspace.objfile_for_address`.
@@ -587,10 +588,12 @@ records them in a generated header, `equates.h`. The tool looks for it in
 this order:
 
 1. The file named with `chez-layout PATH`, if you gave one.
-2. `racket/src/build/cs/c/ChezScheme/boot/ta6le/equates.h`, relative to the
-   racket binary being debugged, which is where it lives in a Racket build
-   tree.
-3. Built-in values, which match Racket CS 9.3.0.8.
+2. `racket/src/build/cs/c/ChezScheme/boot/ta6le/equates.h` (on arm64,
+   `boot/tarm64le/equates.h`), relative to the racket binary being
+   debugged, which is where it lives in a Racket build tree.
+3. Built-in values, which match Racket CS 9.3.0.8. On arm64 the thread
+   context's fields sit 0x48 bytes further on than on x86_64; the rest of
+   the layout is the same.
 
 `chez-layout` with no argument says which one is in use. If you debug a
 Racket installed from a distribution, there is no build tree. Use the
@@ -599,7 +602,7 @@ values if the version matches.
 
 A build tree also contains `racket/src/ChezScheme/boot/pb/equates.h`. That
 file is for Chez's portable bytecode machine type, and its offsets differ;
-use the `ta6le` one.
+use the `ta6le` (or `tarm64le`) one.
 
 If the layout is wrong, the symptoms are names like `<non-string ...>`, a
 `current-atomic` that is not a small number, or backtraces that stop
@@ -614,7 +617,7 @@ the program runs again, since code can move while it runs.
 
 **Registers.** On x86_64 Linux, Chez keeps the thread context (`tc`) in
 `%r14`, the Scheme frame pointer in `%r13` and the current closure in
-`%r15`. These are callee-saved in the C ABI, so gdb recovers their values
+`%r15`; on arm64 they are `x19`, `x20` and `x26`. These are callee-saved in the C ABI, so gdb recovers their values
 in Scheme frames even when the program stopped in C. If they do not look
 like Scheme's, the tool asks the program for its thread context through
 `pthread_getspecific(S_tc_key)`; that needs a live process.
@@ -655,9 +658,11 @@ that is a return address into a C function gdb can name.
 
 ## Limitations
 
-- **x86_64 Linux only.** Other platforms assign Chez's registers
-  differently, and the tool does not know those assignments.
-- **The hand-off back to C is a heuristic.** A stale code pointer on the
+- **x86_64 and arm64 Linux only.** Other platforms assign Chez's
+  registers differently, and the tool does not know those assignments.
+- **On x86_64, the hand-off back to C is a heuristic.** (On arm64 it
+  comes from the jump buffer that the C entry saved, and falls back to the
+  C frame pointer, which Chez code leaves alone.) A stale code pointer on the
   C stack above Scheme's stack pointer could make the frames after the
   Scheme ones wrong. The Scheme frames themselves are unaffected, and
   `chez-stack` does not depend on the hand-off at all.
