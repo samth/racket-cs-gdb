@@ -132,4 +132,4 @@
                   (rename-file-or-directory tmp (build-path "/tmp" filename) #t))
                 (lambda () (when (file-exists? tmp) (delete-file tmp))))
   (hash 'map filename 'code_objects (length entries)
-        'layout (if layout-path (path->string layout-path) "built-in values for Racket CS 9.3.0.8")))
+        'layout (if layout-path (if (path? layout-path) (path->string layout-path) layout-path) "built-in values for Racket CS 9.3.0.8")))
