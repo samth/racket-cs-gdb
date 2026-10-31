@@ -123,6 +123,7 @@ DEFAULT_LAYOUT = {
     "tc_stack_link_disp": 0x150,
     "tc_sfp_disp": 0x38,
     "tc_cp_disp": 0x40,
+    "tc_cchain_disp": 0x128,
     "continuation_code_disp": 0x3,
     "continuation_stack_disp": 0xB,
     "continuation_stack_length_disp": 0x13,
@@ -614,6 +615,8 @@ class ChezUnwinder(Unwinder):
             else:
                 info.add_saved_register("pc", gdb.Value(u64(ret_at)).cast(pc_type))
                 info.add_saved_register("rsp", gdb.Value(ret_at + 8).cast(reg_type))
+                for reg, value in c_entry_registers(tc, ret_at + 8):
+                    info.add_saved_register(reg, gdb.Value(value).cast(reg_type))
         return info
 
     @staticmethod
@@ -631,6 +634,53 @@ class ChezUnwinder(Unwinder):
                         function is None or s.split(" ")[0] == function):
                     return rsp + i
         return None
+
+
+def _pointer_guard():
+    """glibc's pointer guard for this thread (tcbhead_t.pointer_guard at
+    %fs:0x30), which setjmp uses to mangle saved rbp, rsp and pc."""
+    try:
+        return u64(int(gdb.parse_and_eval("$fs_base")) + 0x30)
+    except gdb.error:
+        return None
+
+
+def _demangle(v, guard):
+    v &= (1 << 64) - 1
+    return ((v >> 0x11) | (v << (64 - 0x11))) & ((1 << 64) - 1) ^ guard
+
+
+def c_entry_registers(tc, sp):
+    """The registers of the C function (S_call_help) that entered Scheme
+    with its stack pointer at sp, from the jump buffer it set up. Chez's
+    C-to-Scheme entries leave Scheme only by longjmp, so nothing on the
+    Scheme side keeps the C frame's callee-saved registers, and gdb needs
+    them (at least the frame pointer) to unwind that C frame. Each entry
+    pushes (jmpbuf . _) on the thread's C chain. A glibc jmp_buf holds rbx,
+    rbp, r12-r15, rsp, pc, with rbp, rsp and pc mangled by the pointer
+    guard; a __builtin_setjmp buffer holds the frame pointer, a label, and
+    the stack pointer. Returns a list of (register, value)."""
+    L = layout()
+    guard = _pointer_guard()
+    try:
+        chain = u64(tc + L.tc_cchain_disp)
+        for _ in range(10000):
+            if chain & 7 != L.type_pair:
+                return []
+            entry = u64(chain + L.pair_car_disp)
+            if entry & 7 == L.type_pair:
+                jb = u64(entry + L.pair_car_disp)
+                if jb:
+                    w = [u64(jb + 8 * i) for i in range(8)]
+                    if guard is not None and _demangle(w[6], guard) == sp:
+                        return [("rbx", w[0]), ("rbp", _demangle(w[1], guard)), ("r12", w[2]),
+                                ("r13", w[3]), ("r14", w[4]), ("r15", w[5])]
+                    if w[2] == sp:
+                        return [("rbp", w[0])]
+            chain = u64(chain + L.pair_cdr_disp)
+    except gdb.MemoryError:
+        return []
+    return []
 
 
 def _c_symbol(addr):
