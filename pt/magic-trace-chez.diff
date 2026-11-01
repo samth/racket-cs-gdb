@@ -1,0 +1,690 @@
+diff --git a/src/chez_mode.ml b/src/chez_mode.ml
+new file mode 100644
+index 0000000..d35ed2f
+--- /dev/null
++++ b/src/chez_mode.ml
+@@ -0,0 +1,472 @@
++open! Core
++
++(* Chez Scheme (and so Racket CS) calls and returns with [jmp]s on x86_64:
++
++   - a non-tail call stores its return address in the frame and jumps:
++     [lea ret(%rip),%reg; mov %reg,0x0(%r13); jmp target]
++   - a tail call jumps to a code object's entry without storing one
++   - a return jumps through the frame: [jmp *0x0(%r13)], or, for a single-value
++     return through a register, [jmp *%r12], or for multiple values to the
++     mv-return address stored 0x20 bytes before the return point
++
++   perf flags all of these as plain jumps, so the trace writer would treat every Chez
++   call as a tail call and show flat stacks. This module sits between [perf script]
++   and the writer: it reads the code bytes from the jitdump that Chez writes
++   (CHEZ_JITDUMP=dir, CHEZ_JITDUMP_TSC=1) and turns those jumps into the [Call],
++   [Return] and [Jump] events the writer understands.
++
++   It keeps its own copy of each thread's stack, with the return address of each
++   frame, and updates it exactly as the writer updates its stack for the events
++   it passes on. That lets it pop several frames at once (escapes, C returns into
++   Scheme) by emitting several [Return]s, and resynchronize when a return matches no
++   frame. *)
++
++module Extra = struct
++  type t =
++    { src_dso : string
++    ; dst_dso : string
++    ; ilen : int
++    ; is_jcc : bool
++    }
++end
++
++module Jitdump = struct
++  type t =
++    { data : string
++    ; (* code index -> (code address, offset of the code bytes in [data], size) *)
++      code : (int, int64 * int * int) Hashtbl.t
++    }
++
++  let load path =
++    let data = In_channel.read_all path in
++    let code = Hashtbl.create (module Int) in
++    let len = String.length data in
++    if len >= 12 && Int32.(Stdlib.String.get_int32_le data 0 = 0x4A695444l)
++    then (
++      let hdr_size = Int32.to_int_exn (Stdlib.String.get_int32_le data 8) in
++      let rec loop pos =
++        if pos + 16 <= len
++        then (
++          let id = Int32.to_int_exn (Stdlib.String.get_int32_le data pos) in
++          let size = Int32.to_int_trunc (Stdlib.String.get_int32_le data (pos + 4)) in
++          if size >= 16 && pos + size <= len
++          then (
++            if id = 0 && size >= 56
++            then (
++              (* JIT_CODE_LOAD: id, size, time, pid, tid, vma, code_addr, code_size,
++                 code_index, name\0, code *)
++              let addr = Stdlib.String.get_int64_le data (pos + 32) in
++              let csize = Int64.to_int_exn (Stdlib.String.get_int64_le data (pos + 40)) in
++              let index = Int64.to_int_exn (Stdlib.String.get_int64_le data (pos + 48)) in
++              match String.index_from data (pos + 56) '\000' with
++              | Some nend when nend + 1 + csize <= len ->
++                Hashtbl.set code ~key:index ~data:(addr, nend + 1, csize)
++              | _ -> ());
++            loop (pos + size)))
++      in
++      loop hdr_size);
++    { data; code }
++  ;;
++end
++
++let jitted_re = Re.Perl.re {|^(.*)/jitted-([0-9]+)-([0-9]+)\.so$|} |> Re.compile
++
++module Frame = struct
++  type t =
++    { loc : Event.Location.t
++    ; ret : int64 option
++    ; mvret : int64 option
++    ; path : string (* folded-stack key of this frame and the ones below it *)
++    ; run : int (* how many frames in a row, ending here, have this frame's symbol *)
++    }
++end
++
++module Thread_state = struct
++  type t =
++    { mutable stack : Frame.t list
++    ; mutable depth : int
++    ; mutable last_time : Time_ns.Span.t option
++    }
++end
++
++type t =
++  { jitdumps : (string, Jitdump.t option) Hashtbl.t
++  ; threads : (Event.Thread.t, Thread_state.t) Hashtbl.t
++  ; stats : (string, int) Hashtbl.t
++  ; entries : (string, int) Hashtbl.t
++  ; folded : (string, int) Hashtbl.t option
++  ; mutable max_depth : int
++  ; depth_hist : (int, int) Hashtbl.t
++  }
++
++let create ~fold =
++  { jitdumps = Hashtbl.create (module String)
++  ; threads = Hashtbl.create (module Event.Thread)
++  ; stats = Hashtbl.create (module String)
++  ; entries = Hashtbl.create (module String)
++  ; folded = (if fold then Some (Hashtbl.create (module String)) else None)
++  ; max_depth = 0
++  ; depth_hist = Hashtbl.create (module Int)
++  }
++;;
++
++let count t key = Hashtbl.incr t.stats key
++
++(* the code object containing [dso]'s code, from the jitdump next to the
++   jitted-PID-INDEX.so file that [perf inject --jit] made from it *)
++let code_of t dso =
++  match Re.exec_opt jitted_re dso with
++  | None -> None
++  | Some g ->
++    let path = [%string "%{Re.Group.get g 1}/jit-%{Re.Group.get g 2}.dump"] in
++    let index = Int.of_string (Re.Group.get g 3) in
++    let jd =
++      Hashtbl.find_or_add t.jitdumps path ~default:(fun () ->
++        match Jitdump.load path with
++        | jd -> Some jd
++        | exception exn ->
++          eprint_s [%message "chez mode: cannot read jitdump" path (exn : exn)];
++          None)
++    in
++    Option.bind jd ~f:(fun jd ->
++      Option.map (Hashtbl.find jd.code index) ~f:(fun (addr, off, size) ->
++        jd.data, addr, off, size))
++;;
++
++let is_jitted dso = Re.execp jitted_re dso
++let byte s i = Char.to_int (String.unsafe_get s i)
++
++(* [jmp *0x0(%r13)] *)
++let is_frame_return data off size o ilen =
++  ilen = 4
++  && o >= 0
++  && o + 4 <= size
++  && byte data (off + o) = 0x41
++  && byte data (off + o + 1) = 0xff
++  && byte data (off + o + 2) = 0x65
++  && byte data (off + o + 3) = 0x00
++;;
++
++(* If the jmp at code offset [o] follows [lea ret(%rip),%reg; mov %reg,0x0(%r13)],
++   the return address and the mv-return address in the return point's header. *)
++let call_return_address data off size addr o =
++  let b i = byte data (off + i) in
++  let rec find_lea p =
++    if p < Int.max 0 (o - 40)
++    then None
++    else (
++      let rex = b p
++      and op = b (p + 1)
++      and modrm = b (p + 2) in
++      if (rex = 0x48 || rex = 0x4c) && op = 0x8d && modrm land 0xc7 = 0x05
++      then (
++        let disp = Int32.to_int_exn (Stdlib.String.get_int32_le data (off + p + 3)) in
++        let target = p + 7 + disp in
++        if target <= o || target > size
++        then find_lea (p - 1)
++        else (
++          let reg = ((modrm lsr 3) land 7) lor if rex = 0x4c then 8 else 0 in
++          let rec find_mov q =
++            if q >= o - 3
++            then None
++            else (
++              let mrex = b q
++              and mop = b (q + 1)
++              and mmod = b (q + 2) in
++              if (mrex = 0x49 || mrex = 0x4d)
++                 && mop = 0x89
++                 && mmod land 0xc7 = 0x45
++                 && b (q + 3) = 0
++                 && ((mmod lsr 3) land 7) lor (if mrex = 0x4d then 8 else 0) = reg
++              then (
++                let mvret =
++                  if target >= 0x20
++                  then Some (Stdlib.String.get_int64_le data (off + target - 0x20))
++                  else None
++                in
++                Some (Int64.(addr + of_int target), mvret))
++              else find_mov (q + 1))
++          in
++          find_mov (p + 7)))
++      else find_lea (p - 1))
++  in
++  if o < 7 || o > size then None else find_lea (o - 7)
++;;
++
++let thread_state t thread =
++  Hashtbl.find_or_add t.threads thread ~default:(fun () ->
++    { Thread_state.stack = []; depth = 0; last_time = None })
++;;
++
++let name_of (loc : Event.Location.t) =
++  String.map (Symbol.display_name loc.symbol) ~f:(function
++    | ';' | ' ' -> '_'
++    | c -> c)
++;;
++
++let path_on (below : Frame.t list) loc =
++  match below with
++  | [] -> name_of loc
++  | f :: _ -> f.path ^ ";" ^ name_of loc
++;;
++
++(* The stack operations below mirror what the writer does with the events we emit. *)
++
++let run_on (below : Frame.t list) (loc : Event.Location.t) =
++  match below with
++  | f :: _ when Symbol.equal f.loc.symbol loc.symbol -> f.run + 1
++  | _ -> 1
++;;
++
++let max_runs : (string, int) Hashtbl.t = Hashtbl.create (module String)
++
++let note_run (f : Frame.t) =
++  if f.run > 1
++  then
++    Hashtbl.update max_runs (name_of f.loc) ~f:(function
++      | Some r when r >= f.run -> r
++      | _ -> f.run)
++;;
++
++let push (ts : Thread_state.t) ?ret ?mvret loc =
++  let f = { Frame.loc; ret; mvret; path = path_on ts.stack loc; run = run_on ts.stack loc } in
++  note_run f;
++  ts.stack <- f :: ts.stack;
++  ts.depth <- ts.depth + 1
++;;
++
++let pop (ts : Thread_state.t) =
++  match ts.stack with
++  | [] -> ()
++  | _ :: rest ->
++    ts.stack <- rest;
++    ts.depth <- ts.depth - 1
++;;
++
++(* the writer's [check_current_symbol]: rename the top frame (keeping its return
++   address, as a tail call does) or start a stack *)
++let check_symbol (ts : Thread_state.t) (loc : Event.Location.t) =
++  match ts.stack with
++  | f :: rest when not (Symbol.equal f.loc.symbol loc.symbol) ->
++    let f = { f with loc; path = path_on rest loc; run = run_on rest loc } in
++    note_run f;
++    ts.stack <- f :: rest
++  | _ :: _ -> ()
++  | [] -> push ts loc
++;;
++
++let clear (ts : Thread_state.t) =
++  ts.stack <- [];
++  ts.depth <- 0
++;;
++
++(* how many frames to pop to return to [dst], if a frame is waiting for it *)
++let frames_to dst (ts : Thread_state.t) =
++  let rec loop n = function
++    | [] -> None
++    | (f : Frame.t) :: rest ->
++      if Option.equal Int64.equal f.ret (Some dst)
++         || Option.equal Int64.equal f.mvret (Some dst)
++      then Some n
++      else loop (n + 1) rest
++  in
++  loop 1 ts.stack
++;;
++
++let make (ok : Event.Ok.t) kind ~(src : Event.Location.t) ~(dst : Event.Location.t)
++  : Event.t
++  =
++  Ok { ok with data = Trace { trace_state_change = None; kind = Some kind; src; dst } }
++;;
++
++(* pop [n] frames: the writer pops one per [Return] and then renames the new top to
++   the return's destination, so every [Return] but the last goes to the frame it
++   exposes *)
++let returns t ok (ts : Thread_state.t) n ~src ~(dst : Event.Location.t) =
++  let rec loop n acc =
++    if n <= 1
++    then (
++      pop ts;
++      check_symbol ts dst;
++      List.rev (make ok Return ~src ~dst :: acc))
++    else (
++      pop ts;
++      let exposed =
++        match ts.stack with
++        | f :: _ -> f.loc
++        | [] -> dst
++      in
++      if List.is_empty ts.stack then check_symbol ts exposed;
++      loop (n - 1) (make ok Return ~src ~dst:exposed :: acc))
++  in
++  if n > 1 then count t "frames popped by multi-frame returns";
++  loop n []
++;;
++
++let call t ok ts ?ret ?mvret ~src ~(dst : Event.Location.t) () =
++  ignore t;
++  push ts ?ret ?mvret dst;
++  [ make ok Call ~src ~dst ]
++;;
++
++let jump ok ts ~src ~dst =
++  check_symbol ts dst;
++  [ make ok Jump ~src ~dst ]
++;;
++
++let classify t (ok : Event.Ok.t) ts (extra : Extra.t) kind ~src ~(dst : Event.Location.t)
++  =
++  let dst_ip = dst.instruction_pointer in
++  match (kind : Event.Kind.t) with
++  | Call ->
++    count t "C calls";
++    call
++      t
++      ok
++      ts
++      ~ret:Int64.(src.Event.Location.instruction_pointer + of_int extra.ilen)
++      ~src
++      ~dst
++      ()
++  | Return ->
++    (match frames_to dst_ip ts with
++     | Some n ->
++       count t "C returns matched";
++       returns t ok ts n ~src ~dst
++     | None ->
++       count t "C returns unmatched (renamed top)";
++       jump ok ts ~src ~dst)
++  | _ ->
++    (match frames_to dst_ip ts with
++     | Some n ->
++       count t "returns matched";
++       returns t ok ts n ~src ~dst
++     | None ->
++       (match code_of t extra.src_dso with
++        | Some (data, addr, off, size) ->
++          let o = src.symbol_offset in
++          if is_frame_return data off size o extra.ilen
++          then (
++            count t "returns unmatched (resync: pop one)";
++            returns t ok ts 1 ~src ~dst)
++          else (
++            match call_return_address data off size addr o with
++            | Some (ret, mvret) ->
++              count t "non-tail calls";
++              Hashtbl.incr t.entries (name_of dst);
++              call t ok ts ~ret ?mvret ~src ~dst ()
++            | None ->
++              if dst.symbol_offset = 0 && is_jitted extra.dst_dso
++              then (
++                count t "tail calls";
++                Hashtbl.incr t.entries (name_of dst))
++              else count t "other jumps";
++              jump ok ts ~src ~dst)
++        | None ->
++          if dst.symbol_offset = 0 && is_jitted extra.dst_dso
++          then (
++            count t "jumps from C to a Scheme entry";
++            Hashtbl.incr t.entries (name_of dst))
++          else count t "other jumps";
++          jump ok ts ~src ~dst))
++;;
++
++(* the writer's handling of the events we pass on unchanged *)
++let mirror_passthrough (ts : Thread_state.t) (data : Event.Ok.Data.t) =
++  match data with
++  | Trace { kind; trace_state_change; src = _; dst } ->
++    (match kind, trace_state_change with
++     | Some Call, (None | Some End) -> push ts dst
++     | (None | Some Async), Some End -> push ts Event.Location.untraced
++     | Some Syscall, Some End -> push ts Event.Location.syscall
++     | Some Return, Some End -> push ts Event.Location.returned
++     | None, Some Start -> if List.is_empty ts.stack then push ts dst else pop ts
++     | Some (Jump | Interrupt | Tx_abort | Return), None -> check_symbol ts dst
++     | _ -> ())
++  | _ -> ()
++;;
++
++let weigh t (ts : Thread_state.t) time =
++  (match t.folded, ts.last_time, ts.stack with
++   | Some folded, Some last, f :: _ ->
++     let d = Time_ns.Span.to_int_ns Time_ns.Span.(time - last) in
++     if d > 0 then Hashtbl.update folded f.path ~f:(fun v -> Option.value v ~default:0 + d)
++   | _ -> ());
++  ts.last_time <- Some time
++;;
++
++let process t (event : Event.t) (extra : Extra.t option) : Event.t list =
++  match event with
++  | Error err ->
++    count t "decode errors (stack cleared)";
++    Option.iter (Hashtbl.find t.threads err.thread) ~f:clear;
++    [ event ]
++  | Ok ok ->
++    let ts = thread_state t ok.thread in
++    weigh t ts ok.time;
++    let out =
++      match ok.data, extra with
++      | Trace { kind = Some ((Call | Return | Jump) as kind); trace_state_change = None; src; dst }
++      , Some extra ->
++        if extra.is_jcc
++        then
++          (* conditional branches stay inside one code object; drop those, which
++             cannot change the writer's stack either *)
++          if Symbol.equal src.symbol dst.symbol
++          then []
++          else (
++            check_symbol ts dst;
++            [ event ])
++        else classify t ok ts extra kind ~src ~dst
++      | data, _ ->
++        mirror_passthrough ts data;
++        [ event ]
++    in
++    (match extra with
++     | Some { dst_dso; is_jcc = false; _ } when is_jitted dst_dso ->
++       Hashtbl.incr t.depth_hist ts.depth;
++       if ts.depth > t.max_depth then t.max_depth <- ts.depth
++     | _ -> ());
++    out
++;;
++
++let report t ~folded_path =
++  let sorted tbl =
++    Hashtbl.to_alist tbl |> List.sort ~compare:(fun (_, a) (_, b) -> Int.compare b a)
++  in
++  eprintf "chez mode: max Scheme-event depth %d\n" t.max_depth;
++  List.iter
++    (Hashtbl.to_alist t.stats |> List.sort ~compare:[%compare: string * int])
++    ~f:(fun (k, v) -> eprintf "chez mode: %-40s %d\n" k v);
++  eprintf
++    "chez mode: top Scheme entries (non-tail + tail calls): %s\n"
++    (List.take (sorted t.entries) 10
++     |> List.map ~f:(fun (k, v) -> sprintf "%s=%d" k v)
++     |> String.concat ~sep:", ");
++  eprintf
++    "chez mode: deepest self-recursion (frames in a row): %s\n"
++    (List.take (sorted max_runs) 8
++     |> List.map ~f:(fun (k, v) -> sprintf "%s=%d" k v)
++     |> String.concat ~sep:", ");
++  let total = Hashtbl.fold t.depth_hist ~init:0 ~f:(fun ~key:_ ~data acc -> acc + data) in
++  let bucket lo hi =
++    Hashtbl.fold t.depth_hist ~init:0 ~f:(fun ~key ~data acc ->
++      if key >= lo && key <= hi then acc + data else acc)
++  in
++  if total > 0
++  then
++    eprintf
++      "chez mode: depth of events landing in Scheme: 0-1 %.1f%%, 2-5 %.1f%%, 6-10 \
++       %.1f%%, 11-20 %.1f%%, 21-40 %.1f%%, 41+ %.1f%%\n"
++      (100. *. Float.of_int (bucket 0 1) /. Float.of_int total)
++      (100. *. Float.of_int (bucket 2 5) /. Float.of_int total)
++      (100. *. Float.of_int (bucket 6 10) /. Float.of_int total)
++      (100. *. Float.of_int (bucket 11 20) /. Float.of_int total)
++      (100. *. Float.of_int (bucket 21 40) /. Float.of_int total)
++      (100. *. Float.of_int (bucket 41 Int.max_value) /. Float.of_int total);
++  match t.folded, folded_path with
++  | Some folded, Some path ->
++    Out_channel.with_file path ~f:(fun oc ->
++      List.iter (sorted folded) ~f:(fun (k, v) -> fprintf oc "%s %d\n" k v))
++  | _ -> ()
++;;
+diff --git a/src/env_vars.ml b/src/env_vars.ml
+index 5157942..ee391f7 100644
+--- a/src/env_vars.ml
++++ b/src/env_vars.ml
+@@ -47,3 +47,12 @@ let no_ocaml_exception_debug_info =
+ let skip_transaction_handling =
+   Option.is_some (Unix.getenv "MAGIC_TRACE_SKIP_TX_HANDLING")
+ ;;
++
++(* Reconstruct Chez Scheme / Racket CS call stacks (see [Chez_mode]). Recording adds
++   [noretcomp] to the Intel PT event; decoding runs [perf inject --jit] on the
++   recording, so run the program with CHEZ_JITDUMP=dir and CHEZ_JITDUMP_TSC=1. *)
++let chez = Option.is_some (Unix.getenv "MAGIC_TRACE_CHEZ")
++
++(* In Chez mode, also write folded stacks (weighted by trace time in ns) to this
++   file, for flame graphs and comparison with sampling profilers. *)
++let chez_folded = Unix.getenv "MAGIC_TRACE_CHEZ_FOLDED"
+diff --git a/src/env_vars.mli b/src/env_vars.mli
+index b9348f4..6a879d4 100644
+--- a/src/env_vars.mli
++++ b/src/env_vars.mli
+@@ -10,3 +10,5 @@ val no_dlfilter : bool
+ val fzf_demangle_symbols : bool
+ val no_ocaml_exception_debug_info : bool
+ val skip_transaction_handling : bool
++val chez : bool
++val chez_folded : string option
+diff --git a/src/perf_decode.ml b/src/perf_decode.ml
+index 28480f4..c6e5481 100644
+--- a/src/perf_decode.ml
++++ b/src/perf_decode.ml
+@@ -21,7 +21,7 @@ let perf_callstack_entry_re = Re.Perl.re "^\t *([0-9a-f]+) (.*)$" |> Re.compile
+ 
+ let perf_branches_event_re =
+   Re.Perl.re
+-    {|^ *(call|return|tr strt|syscall|sysret|hw int|iret|int|tx abrt|tr end|tr strt tr end|tr end  (?:async|call|return|syscall|sysret|iret)|jmp|jcc) +(\(x\) +)?([0-9a-f]+) (.*) => +([0-9a-f]+) (.*)$|}
++    {|^ *(call|return|tr strt(?: jmp)?|syscall|sysret|hw int|iret|int|tx abrt|tr end|tr strt tr end|tr end  (?:async|call|return|syscall|sysret|iret|jmp|jcc)|jmp|jcc) +(\(x\) +)?([0-9a-f]+) (.*) => +([0-9a-f]+) (.*)$|}
+   |> Re.compile
+ ;;
+ 
+@@ -235,12 +235,25 @@ let parse_perf_branches_event ?perf_maps (thread : Event.Thread.t) time line : E
+     let starts_trace, kind =
+       match String.chop_prefix kind ~prefix:"tr strt" with
+       | None -> false, kind
+-      | Some rest -> true, String.lstrip ~drop:Char.is_whitespace rest
++      | Some rest ->
++        ( true
++        , String.lstrip
++            ~drop:Char.is_whitespace
++            (match String.chop_prefix rest ~prefix:" jmp" with
++             | None -> rest
++             | Some r -> r) )
+     in
+     let ends_trace, kind =
+       match String.chop_prefix kind ~prefix:"tr end" with
+       | None -> false, kind
+-      | Some rest -> true, String.lstrip ~drop:Char.is_whitespace rest
++      | Some rest ->
++        (* perf 6+ also prints the kind of the branch that ended tracing, e.g.
++           "tr end  jmp"; a plain jump or conditional branch out of the trace is
++           just the end of tracing *)
++        ( true
++        , (match String.strip rest with
++           | "jmp" | "jcc" -> ""
++           | rest -> rest) )
+     in
+     let trace_state_change : Trace_state_change.t option =
+       match starts_trace, ends_trace with
+@@ -401,13 +414,55 @@ let split_line_pipe pipe : string list Pipe.Reader.t =
+   reader
+ ;;
+ 
++(* Chez mode records [insnlen] too; [perf script] appends it as " ilen: N". *)
++let ilen_re = Re.Perl.re {|^(.*?)\s+ilen:\s+([0-9]+)\s*$|} |> Re.compile
++let dso_re = Re.Perl.re {|\(([^()]*)\)\s*$|} |> Re.compile
++let branch_kind_re = Re.Perl.re {|branches:[a-zA-Z]*:\s+(jcc|jmp|call|return)\s|} |> Re.compile
++
++let chez_extra line : string * Chez_mode.Extra.t option =
++  let line, ilen =
++    match Re.exec_opt ilen_re line with
++    | Some g -> Re.Group.get g 1, Int.of_string (Re.Group.get g 2)
++    | None -> line, 0
++  in
++  match Re.exec_opt branch_kind_re line, String.substr_index line ~pattern:" => " with
++  | Some g, Some arrow ->
++    let dso_of s =
++      match Re.exec_opt dso_re s with
++      | Some g -> Re.Group.get g 1
++      | None -> ""
++    in
++    let src_dso = dso_of (String.prefix line arrow) in
++    let dst_dso = dso_of line in
++    ( line
++    , Some { Chez_mode.Extra.src_dso; dst_dso; ilen; is_jcc = String.( = ) (Re.Group.get g 1) "jcc" } )
++  | _ -> line, None
++;;
++
+ let to_events ?perf_maps pipe =
+   let pipe = split_line_pipe pipe in
+   (* Every route of filtering on streams in an async way seems to be deprecated,
+      including converting to pipes which says that the stream creation should be
+      switched to a pipe creation. Changing Async_shell is out-of-scope, and I also
+      can't see a reason why filter_map would lead to memory leaks. *)
+-  Pipe.map pipe ~f:(to_event ?perf_maps) |> Pipe.filter_map ~f:Fn.id
++  if Env_vars.chez
++  then (
++    let chez = Chez_mode.create ~fold:(Option.is_some Env_vars.chez_folded) in
++    let events =
++      Pipe.concat_map_list pipe ~f:(fun lines ->
++        match lines with
++        | [] -> []
++        | first_line :: rest ->
++          let first_line, extra = chez_extra first_line in
++          (match to_event ?perf_maps (first_line :: rest) with
++           | None -> []
++           | Some event -> Chez_mode.process chez event extra))
++    in
++    don't_wait_for
++      (let%map () = Pipe.closed events in
++       Chez_mode.report chez ~folded_path:Env_vars.chez_folded);
++    events)
++  else Pipe.map pipe ~f:(to_event ?perf_maps) |> Pipe.filter_map ~f:Fn.id
+ ;;
+ 
+ let%test_module _ =
+diff --git a/src/perf_tool_backend.ml b/src/perf_tool_backend.ml
+index ce10634..b1f537e 100644
+--- a/src/perf_tool_backend.ml
++++ b/src/perf_tool_backend.ml
+@@ -188,6 +188,13 @@ module Recording = struct
+         let%map.Or_error intel_pt_config =
+           perf_intel_pt_config_of_timer_resolution ~capabilities timer_resolution
+         in
++        let intel_pt_config =
++          (* Chez code enters and leaves C without balanced call/ret, which breaks
++             return compression *)
++          if Env_vars.chez && not (String.is_substring intel_pt_config ~substring:"noretcomp")
++          then String.concat ~sep:"," (List.filter [ intel_pt_config; "noretcomp=1" ] ~f:(Fn.non String.is_empty))
++          else intel_pt_config
++        in
+         [%string "intel_pt/%{intel_pt_config}/%{selector}"]
+       | Stacktrace_sampling _ ->
+         let%map.Or_error cycles_config =
+@@ -475,7 +482,7 @@ let decode_events
+     match
+       ( Perf_capabilities.(do_intersect capabilities dlfilter)
+       , collection_mode
+-      , Env_vars.no_dlfilter || not filter_same_symbol_jumps )
++      , Env_vars.no_dlfilter || Env_vars.chez || not filter_same_symbol_jumps )
+     with
+     | true, Intel_processor_trace _, false ->
+       let filename = record_dir ^/ "perf_dlfilter.so" in
+@@ -487,7 +494,28 @@ let decode_events
+   let%bind files =
+     Sys.readdir record_dir
+     >>| Array.to_list
+-    >>| List.filter ~f:(String.is_prefix ~prefix:"perf.data")
++    >>| List.filter ~f:(fun file ->
++      String.is_prefix file ~prefix:"perf.data"
++      && not (String.is_suffix file ~suffix:".chez-jit"))
++  in
++  let%bind files =
++    if not Env_vars.chez
++    then return files
++    else
++      (* name the Scheme code: [perf inject --jit] turns the jitdump records into
++         jitted-PID-INDEX.so files next to the dump *)
++      Deferred.List.map files ~how:`Sequential ~f:(fun file ->
++        let injected = file ^ ".chez-jit" in
++        let args =
++          [ "inject"; "--jit"; "-i"; record_dir ^/ file; "-o"; record_dir ^/ injected ]
++        in
++        if debug_print_perf_commands
++        then Core.printf "%s %s\n%!" perf (String.concat ~sep:" " args);
++        match%map Process.run ~env:perf_env ~prog:perf ~args () with
++        | Ok _ -> injected
++        | Error err ->
++          Core.eprint_s [%message "chez mode: perf inject --jit failed" (err : Error.t)];
++          file)
+   in
+   let%map result =
+     Deferred.List.map files ~how:`Sequential ~f:(fun perf_data_file ->
+@@ -499,7 +527,10 @@ let decode_events
+       let fields_opts =
+         match collection_mode with
+         | Intel_processor_trace _ ->
+-          [ "-F"; "pid,tid,time,flags,ip,addr,sym,symoff,synth,dso,event,period" ]
++          [ "-F"
++          ; "pid,tid,time,flags,ip,addr,sym,symoff,synth,dso,event,period"
++            ^ if Env_vars.chez then ",insnlen" else ""
++          ]
+         | Stacktrace_sampling _ -> [ "-F"; "pid,tid,time,ip,sym,symoff,dso,event,period" ]
+       in
+       let args =
+diff --git a/src/trace_writer.ml b/src/trace_writer.ml
+index 6293daf..91fa1c6 100644
+--- a/src/trace_writer.ml
++++ b/src/trace_writer.ml
+@@ -406,9 +406,12 @@ let write_pending_event'
+     write_duration_begin t ~thread:thread.thread ~name ~time ~args
+   | Ret -> write_duration_end t ~name:display_name ~time ~thread:thread.thread ~args:[]
+   | Ret_from_untraced { reset_time } ->
++    (* The stack's reset time can be a few ns after this event: perf stamps a decode
++       error, which resets the stack, with the time of the last timing packet, and
++       the branches after it can carry earlier times. *)
+     write_duration_complete
+       t
+-      ~time:reset_time
++      ~time:(Mapped_time.min reset_time time)
+       ~time_end:time
+       ~name:(Symbol.display_name Unknown)
+       ~thread:thread.thread
