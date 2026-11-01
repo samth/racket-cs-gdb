@@ -1,9 +1,9 @@
 diff --git a/src/chez_mode.ml b/src/chez_mode.ml
 new file mode 100644
-index 0000000..7bf7808
+index 0000000..73c0551
 --- /dev/null
 +++ b/src/chez_mode.ml
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,603 @@
 +open! Core
 +
 +(* Chez Scheme (and so Racket CS) calls and returns with [jmp]s on x86_64:
@@ -165,8 +165,11 @@ index 0000000..7bf7808
 +;;
 +
 +(* If the jmp at code offset [o] follows [lea ret(%rip),%reg; mov %reg,0x0(%r13)],
-+   the return address and the mv-return address in the return point's header. *)
-+let call_return_address data off size addr o =
++   the return address and the mv-return address in the return point's header.
++   [load_addr] is where the jitdump's copy of the code was loaded and [base] is where
++   the code is now: the collector may have moved it since (a JIT_CODE_MOVE record),
++   and the mv-return address in the copy is relative to where it was loaded. *)
++let call_return_address data off size ~load_addr ~base o =
 +  let b i = byte data (off + i) in
 +  let rec find_lea p =
 +    if p < Int.max 0 (o - 40)
@@ -198,10 +201,12 @@ index 0000000..7bf7808
 +              then (
 +                let mvret =
 +                  if target >= 0x20
-+                  then Some (Stdlib.String.get_int64_le data (off + target - 0x20))
++                  then (
++                    let mv = Stdlib.String.get_int64_le data (off + target - 0x20) in
++                    Some Int64.(mv - load_addr + base))
 +                  else None
 +                in
-+                Some (Int64.(addr + of_int target), mvret))
++                Some (Int64.(base + of_int target), mvret))
 +              else find_mov (q + 1))
 +          in
 +          find_mov (p + 7)))
@@ -436,14 +441,15 @@ index 0000000..7bf7808
 +          events
 +        | None ->
 +       match src_code with
-+        | Some (data, addr, off, size) ->
++        | Some (data, load_addr, off, size) ->
 +          let o = src.symbol_offset in
++          let base = Int64.(src.instruction_pointer - of_int o) in
 +          if is_frame_return data off size o extra.ilen
 +          then (
 +            count t "returns unmatched (resync: pop one)";
 +            returns t ok ts 1 ~src ~dst)
 +          else (
-+            match call_return_address data off size addr o with
++            match call_return_address data off size ~load_addr ~base o with
 +            | Some (ret, mvret) ->
 +              count t "non-tail calls";
 +              Hashtbl.incr t.entries (name_of dst);
@@ -524,6 +530,22 @@ index 0000000..7bf7808
 +            check_symbol ts dst;
 +            [ event ])
 +        else classify t ok ts extra kind ~src ~dst
++      | Trace { trace_state_change = None; kind = Some Iret; src; dst }, _ ->
++        (* In a userspace trace, perf reports a return from a signal handler as an
++           iret to the interrupted instruction. Pop to the nearest frame running that
++           code instead of letting the writer clear the stack. *)
++        let rec find i = function
++          | [] -> None
++          | (f : Frame.t) :: rest ->
++            if Symbol.equal f.loc.symbol dst.symbol then Some i else find (i + 1) rest
++        in
++        (match find 0 ts.stack with
++         | Some 0 | None ->
++           count t "signal returns (iret) as jumps";
++           jump ok ts ~src ~dst
++         | Some n ->
++           count t "signal returns (iret) popping handler frames";
++           returns t ok ts n ~src ~dst)
 +      | Trace { trace_state_change = Some Start; kind = _; src; dst }, _
 +        when keep_stack_on_error && not ts.tracing_stopped ->
 +        (* a start with no end before it: tracing resumed after a decode error *)
@@ -805,3 +827,66 @@ index 6293daf..91fa1c6 100644
        ~time_end:time
        ~name:(Symbol.display_name Unknown)
        ~thread:thread.thread
+diff --git a/vendor/tracing/src/trace.ml b/vendor/tracing/src/trace.ml
+index 2a7be8d..12156d3 100644
+--- a/vendor/tracing/src/trace.ml
++++ b/vendor/tracing/src/trace.ml
+@@ -59,8 +59,18 @@ let translate_time t time =
+ ;;
+ 
+ let intern_string_cached t s =
+-  Hashtbl.find_or_add t.interned_strings s ~default:(fun () ->
+-    TW.intern_string t.writer s)
++  match Hashtbl.find t.interned_strings s with
++  | Some id -> id
++  | None ->
++    (* Programs with more distinct names than FTF has string IDs (DrRacket under Racket
++       CS) would otherwise fail with "ran out of FTF string IDs": start over instead. *)
++    if Hashtbl.length t.interned_strings >= TW.interned_string_capacity t.writer
++    then (
++      Hashtbl.clear t.interned_strings;
++      TW.reset_interned_strings t.writer);
++    let id = TW.intern_string t.writer s in
++    Hashtbl.set t.interned_strings ~key:s ~data:id;
++    id
+ ;;
+ 
+ let span_to_ticks span = Time_ns.Span.to_int_ns span
+diff --git a/vendor/tracing/zero/writer.ml b/vendor/tracing/zero/writer.ml
+index ed178f8..06803af 100644
+--- a/vendor/tracing/zero/writer.ml
++++ b/vendor/tracing/zero/writer.ml
+@@ -185,6 +185,15 @@ let intern_string t s =
+ 
+ let num_temp_strs t = t.num_temp_strs
+ 
++let interned_string_capacity t =
++  String_id.max_value - (String_id.first_temp + t.num_temp_strs) + 1
++;;
++
++(* Start reusing string IDs from the first non-temporary one. Later events see whatever
++   string is set in a slot when they are written, so this is safe as long as the caller
++   forgets every ID it got before. *)
++let reset_interned_strings t = t.next_string_id <- String_id.first_temp + t.num_temp_strs
++
+ let write_header t =
+   ensure_capacity t 8;
+   (* Magic number record *)
+diff --git a/vendor/tracing/zero/writer.mli b/vendor/tracing/zero/writer.mli
+index 4ca1549..b8a450a 100644
+--- a/vendor/tracing/zero/writer.mli
++++ b/vendor/tracing/zero/writer.mli
+@@ -45,6 +45,13 @@ val max_interned_string_length : int
+     interning. *)
+ val intern_string : t -> string -> String_id.t
+ 
++(** How many strings [intern_string] can intern before it runs out of IDs. *)
++val interned_string_capacity : t -> int
++
++(** Make [intern_string] reuse IDs from the start. Every ID it returned before is then
++    invalid once reused, so callers must forget them (e.g. clear their caches). *)
++val reset_interned_strings : t -> unit
++
+ (** This interns a string while re-using a set of 100 reserved string IDs (by default, the
+     number can be overridden at writer creation). Setting the string in a slot overwrites
+     what was previously in that slot so any further events written in the trace see the new

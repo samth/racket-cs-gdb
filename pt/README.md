@@ -106,7 +106,9 @@ depth histogram.
 
 The patch also fixes three problems in stock magic-trace with perf 7: it cannot parse
 `tr end  jmp` lines; the .fxt writer crashes when a stack's reset time runs a few ns
-past the event that uses it; and `decode` decodes `perf inject`'s `*.old` file again.
+past the event that uses it; `decode` decodes `perf inject`'s `*.old` file again; and
+the .fxt writer fails after 32k distinct names ("ran out of FTF string IDs"), so it now
+recycles string IDs.
 
 Unprivileged users are limited by `perf_event_mlock_kb` (516 KB by default) to a
 512K AUX buffer; see EVAL.md for which PT settings and cores keep data loss low.

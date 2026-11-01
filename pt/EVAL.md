@@ -24,7 +24,7 @@ unprivileged (`perf_event_paranoid` = 0, `perf_event_mlock_kb` = 516), 2026-11-0
   so do the stacks lost to decode errors.
 - Practical limits, all from the unprivileged 512 KB AUX buffer and the decoders:
   - full traces lose 5-9% of AUX chunks even on a quiet machine, run at 240-400 MB/s
-    of trace, and take 900-1600 s to decode per second of traced execution;
+    of trace, and take 1100-1850 s to decode per second of traced execution;
   - snapshot mode captures only the last ~190k branches (about 2 ms of compiler
     execution, 0.2 ms with cycle-accurate timing);
   - E-cores overflow 10-30 times more than P-cores; use a P-core;
@@ -71,7 +71,8 @@ Workloads:
 Tools compared:
 
 - **mt** — patched magic-trace, Chez mode (`MAGIC_TRACE_CHEZ=1`): `v4` keeps stacks
-  across errors; `v6` adds saved-stack switching (the final version).
+  across errors; `v6` adds saved-stack switching; `v7` (final) also survives DrRacket's
+  string count and signal returns, and gives output identical to v6 on fib20.
 - **py** — `chez_pt_stacks.py` (same rules as v4, without stack switching).
 - **perf** — `perf script --itrace=i100usg` (perf's own call/ret-based callchains,
   sampled every 100 µs of trace).
@@ -114,7 +115,11 @@ time.
 Other magic-trace fixes: perf 7 prints `tr strt jmp` and `tr end  jmp`, which stock
 v1.2.4 cannot parse (upstream fixed only the first); the .fxt writer crashed when a
 stack's reset time ran a few ns past the event that used it; `perf inject -o` renames
-an old output to `*.old`, which magic-trace then decoded a second time.
+an old output to `*.old`, which magic-trace then decoded a second time; and the .fxt
+writer gives up with "ran out of FTF string IDs" after 32k distinct names (DrRacket has
+more), so it now recycles string IDs, which the format allows. In a userspace trace
+perf reports a few signal returns as `iret`, which stock magic-trace answers by
+clearing the stack; Chez mode pops to the nearest frame running the destination code.
 
 ## Correctness
 
@@ -211,6 +216,7 @@ Scheme; `--scheme-only`) gives a fairer inclusive score:
 |---|---|---|---|---|
 | rkt-list | **0.891 / 0.858** | 0.885 / 0.336 | 0.782 / 0.325 | 0.815 / 0.039 |
 | rkt-load | **0.862 / 0.802** | | | 0.786 / 0.064 |
+| drracket (v7) | **0.863 / 0.755** | | | |
 | cp0 | **0.796 / 0.783** | 0.795 / 0.465 | (OOM) | 0.719 / 0.063 |
 
 Self time is right in every PT tool, since it only needs the IP; nesting needs the
@@ -249,7 +255,7 @@ last user-space location. Any time-weighted PT profile needs this filter.
 | config | median elapsed | min-max | vs none |
 |---|---|---|---|
 | none (frame-free baseline, prof build) | 4964 ms | 4857-5067 | — |
-| jitdump on (`CHEZ_JITDUMP` + TSC) | 4946 ms | 4848-5050 | -0.4% (noise) |
+| jitdump on (`CHEZ_JITDUMP` + TSC) | 4946 ms | 4848-5050 | -0.4% (noise; Racket runs cost +8-16%, below) |
 | sampler, 999 Hz | 5086 ms | 4904-5138 | +2.5% |
 | perf PT snapshot, `noretcomp` | 6241 ms | 6181-6370 | +25.7% |
 | perf PT snapshot, `noretcomp,cyc=1,cyc_thresh=1,mtc_period=0` | 6694 ms | 6609-6747 | +34.9% |
@@ -257,8 +263,79 @@ last user-space location. Any time-weighted PT profile needs this filter.
 | perf PT full, perf on P-core 0 (3 rounds) | 5349-6206 ms | | +7% to +25% (1.9-6.3 GB, varies with loss) |
 | magic-trace Chez mode, snapshot (default Normal timing) | 6698 ms | 6566-6770 | +34.9% |
 
-jitdump itself costs 10-20 ms at Racket startup (`racket -n`: 0.05 s → 0.06-0.07 s)
-and writes 22 MB per process for Racket's boot code (30 MB for Chez fib20).
+jitdump costs little on the Chez compiler bench, but not on Racket. It adds 10-20 ms
+to `racket -n` (0.05 s → 0.06-0.07 s) and writes 22 MB of boot code per process. On
+code-heavy Racket runs it costs much more (untraced, P-core 2, 10 alternating rounds,
+median [range]):
+
+| workload | config | wall | user cycles | instructions | task-clock | dump | records (distinct code objects) |
+|---|---|---|---|---|---|---|---|
+| rkt-list | off | 276.5 ms [262-312] | 1.058 G | 2.242 G | 254.8 ms | — | — |
+| rkt-list | jitdump | 300 ms [292-362], +8.5% | 1.108 G, +4.8% | 2.346 G, +4.7% | 284.1 ms, +11.5% | 71 MB | 82238 (22460) |
+| rkt-list | jitdump + TSC | 303.5 ms [292-339], +9.8% | 1.114 G, +5.4% | 2.346 G, +4.6% | 286.4 ms, +12.4% | 71 MB | 82238 (22460) |
+| drracket | off | 1568 ms [1548-1714] | 8.78 G | 17.03 G | 2014 ms | — | — |
+| drracket | jitdump | 1815 ms [1767-1929], +15.8% | 9.58 G, +9.1% | 18.03 G, +5.9% | 2383 ms, +18.4% | 608 MB | 743150 (62824) |
+| drracket | jitdump + TSC | 1814 ms [1782-1990], +15.8% | 9.40 G, +7.0% | 18.01 G, +5.8% | 2345 ms, +16.5% | 607 MB | 742736 (62826) |
+
+(DrRacket startup wall time is from the program's own clock; it is shorter than in the
+PT section because these runs follow a warm-up. "Distinct" counts (name, size) pairs.)
+
+TSC timestamps cost nothing extra. The cost is the collector moving code: every move
+writes a full load record with the code bytes, about 12 records per code object in
+DrRacket (608 MB per start) and 3.7 in rkt-list, plus a mutex lock per moved object.
+The PT profiles agree: jitdump code is on the stack in 2.9% (rkt-list) and 9.0%
+(DrRacket) of traced user time.
+
+Fix (`perf-profiling` 39c32ef): a move now writes a 64-byte `JIT_CODE_MOVE` record
+(old and new address, the index of the original load record, no code bytes), which
+`perf inject --jit` turns into a mapping of the original `jitted-PID-INDEX.so` at the
+new address. Moved code is collected without a lock (an atomic slot counter; the lock
+is taken only to allocate a chunk of slots), and a hash table from entry address to
+record index and code length finds the load record a move refers to (new code
+clears any entry dead code left at its address). Chez mats pass with it on.
+
+Re-measured the same way (huor, P-core 2, 10 alternating rounds, medians, change vs
+off; the machine was busier than the day before, so wall times ran about 2x and
+cycles, instructions and task-clock are the numbers to compare):
+
+| workload | config | user cycles | instructions | task-clock | dump | loads + moves |
+|---|---|---|---|---|---|---|
+| rkt-list | off | 1.143 G | 2.244 G | 267.3 ms | — | — |
+| rkt-list | old jitdump (840b1a2) | +6.4% | +4.7% | +14.0% | 70.7 MB | 82238 + 0 |
+| rkt-list | move records | +6.0% | +2.6% | +10.9% | 35.6 MB | 36878 + 45358 |
+| rkt-list | move records + TSC | +4.9% | +2.5% | +9.7% | 35.6 MB | 36878 + 45358 |
+| drracket | off | 9.45 G | 16.96 G | 2144 ms | — | — |
+| drracket | old jitdump (840b1a2) | +7.8% | +6.1% | +15.6% | 607.7 MB | 742736 + 0 |
+| drracket | move records | +6.0% | +2.4% | +9.3% | 152.4 MB | 150314 + 443948 |
+| drracket | move records + TSC | +5.7% | +2.3% | +8.7% | 152.3 MB | 150314 + 443472 |
+
+Move records cut the dump 2x (rkt-list) and 4x (DrRacket) and remove about 60% of
+the extra instructions, but +5-6% user cycles and +9-11% task-clock remain: DrRacket
+still writes ~600k records per start, and the rest is per-record work (names for new
+code, the table, timestamps) and the file writes. On the Chez compiler bench the dump
+goes from 31.1 MB to 21.7 MB.
+
+**perf 7.0 crashes on move records.** perf 7.0.14's `perf inject --jit` segfaults at
+the first `JIT_CODE_MOVE`: `jit_repipe_code_move` calls `build_id__mark_dso_hit` with
+a NULL evsel, which walks the pseudo-sample's callchain with it (7.0 changed the load
+path to `dso__set_hit` but not the move path; perf 6.8 works). `jitdump_expand_moves.py`
+rewrites a recorded dump's moves as load records (with the original bytes, self-pointers
+moved) before `perf inject`, and with it DrRacket sampling profiles name Scheme code
+as before.
+
+**Move records are not enough for PT.** A move maps the code bytes as first recorded,
+but the collector rewrites a moved object's direct calls and jumps to other code
+(`x86_64_set_jump`: rel32 when in range, else an absolute address). Sampling only needs
+names, so that does not matter there, but a PT decoder walks the bytes. rkt-list
+snapshots (3 runs each, magic-trace Chez mode) with expanded moves had 90-102 stack
+resyncs and 89-100 decode errors (about 45-54 "Trace doesn't match instruction" and 15-16
+"Failed to get instruction" on top of ~30 overflows), against 48-49 resyncs and 28-37
+errors (overflows only) with full load records. So PT recordings use
+`CHEZ_JITDUMP_NO_MOVES=1`, which writes full load records for moved code as before
+(`chez-pt.sh` and `mt-chez.sh` set it). On DrRacket it costs +9% cycles and +16%
+task-clock, about the old cost, with a 489 MB dump. The PT decoders still rebase
+addresses for moved code (the IP minus its offset, and the mv-return address in the
+code), which keeps them working on dumps with move records, minus the rewritten jumps.
 
 Full tracing loses data instead of slowing the program much: when perf cannot drain
 the 512 KB buffer, the hardware drops trace and the program runs on, so the run-to-run
@@ -276,7 +353,7 @@ vs 4.0 s untraced.
 | cp0 | 639 MB | 1.54 s | 415 | 534/5696 (9.4%) | 24244 | 2677 s (v4: 2495 s) | killed (OOM) | ~1740 |
 | rkt-load | 252 MB | ~1.0 s | 250 | 81/2834 (2.9%) | 13747 | 1122 s | 562 s | ~1120 |
 | rkt-list | 370 MB | 0.88 s | 420 | 168/3428 (4.9%) | 16979 | 1629 s | 889 s | ~1850 |
-| drracket | 2445 MB | ~8 s | ~300 | 1117/25018 (4.5%) | (decode running) | | | |
+| drracket | 2445 MB | ~8 s | ~300 | 1117/25018 (4.5%) | 76420 | 10146 s (v7) | — | ~1270 |
 
 **Decoding is the binding constraint: roughly 20-30 minutes of single-threaded decode
 per second of traced execution.** About half of that is `perf script` itself (the
@@ -359,10 +436,156 @@ Findings:
 
 DrRacket 9.4.0.3 was installed into the /tmp Racket build (`raco pkg install drracket`)
 and started under `xvfb-run` with `bench/drracket-startup.rkt`, which exits once the
-first frame is shown. Untraced startup: 4.0 s (3.8-4.1). Under full PT (program on
-P-core 2, perf on P-core 0): 8.0 s, 2.4 GB of trace, 1117 of 25018 AUX chunks lost
-(4.5%). The magic-trace decode (about 3 hours) is still running; results will be
-added here.
+first frame is shown. Untraced startup: 4.0 s (3.8-4.1); with the 10 kHz sampler
+3.4-4.0 s. Under full PT (program on P-core 2, perf on P-core 0): 8.0 s, 2.4 GB of
+trace, 1117 of 25018 AUX chunks lost (4.5%), 76420 decode errors.
+
+Decoding took 10146 s (2.8 h) and 5.8 GB of memory with magic-trace v7. v6 died after
+37 minutes: DrRacket uses more than the 32k distinct names that the .fxt writer can
+intern, and v7 recycles string IDs instead. The .fxt is 19.3 GB, far past what
+Perfetto loads; the folded stacks (2 GB) are the usable output.
+
+What the reconstruction saw: 61.4M non-tail calls, 30.9M tail calls, 143M C calls;
+returns to a saved stack 283814 (Racket engine swaps); resyncs 362544 (0.6% of
+non-tail calls); 167 unmatched C returns; deepest self-recursion
+`create-the-variables` 1593 frames, `merge-helper@integer-set.rkt:136` 842,
+`loop@char-set.rkt:304` 694. The trace covers every thread: besides the Racket
+thread, glib and PulseAudio threads spend most of their time blocked in
+`g_cond_wait`, `ppoll` and `poll` (the five heaviest stacks, 61% of all trace time).
+
+Against 8 sampler runs (155k samples), after dropping kernel-leaf time and the blocked
+threads' stacks:
+
+| | self overlap | inclusive overlap |
+|---|---|---|
+| all frames | 0.567 | 0.485 |
+| Scheme frames only | 0.863 | 0.755 |
+
+Top inclusive shares, Scheme frames only (PT / sampler): `run-module-instance!`
+91.2/79.6%, `namespace-require+` 77.4/71.1%, `collect/report` 46.1/47.2%,
+`module-path-index-resolve` 31.4/31.1%, `instantiate-linklet` 32.7/28.0%,
+`do-load-binary` 17.5/19.0%. The worst disagreements are `perform-require!` (11.1%
+PT vs 71.8% sampler) and `do-dynamic-require` (79.4% vs 21.0%): PT puts time under
+`do-dynamic-require` that the sampler attributes to `perform-require!` below it, so
+some frames between them are still lost. In all frames, PT also sees time in
+`memmove`, `__tls_get_addr` and GTK's `g_pointer_bit_lock_and_get` (about 5% each)
+that the sampler does not show. Checking afterwards showed that the last two, like
+`vector*-copy!` and `hash-ref` (also ~5% each), each come from a single stack holding
+~145 ms: timestamp gaps, not real cost. With single stacks over 1.5% of the total
+dropped (29.7% of user weight), the Scheme-only overlap is 0.933 self / 0.791
+inclusive. `memmove` (9420 stacks, mostly the collector's `copy`) and
+`pthread_mutex_lock` (16055 stacks) are real.
+
+## What the traces say about the programs
+
+From the folded stacks and Chez-mode counts (traced time, so GC and kernel-heavy work
+is inflated; user-leaf time only, single stacks over 50 ms dropped):
+
+| | rkt-list (317 ms user) | DrRacket (2155 ms user) |
+|---|---|---|
+| under a collection (`S_do_gc`, `S_gc_*_entry`, `Scompact_heap`) | 34.2% | 46.0% |
+| reading fasl / boot code (`faslin`, `S_vfasl`, `fasl_entry`) | 13.8% | 14.0% |
+| symbol interning (`S_intern*`) | 5.8% | 8.9% |
+| jitdump hooks | 2.9% | 9.0% |
+| mutex operations (`S_mutex_*`, `pthread_mutex_*`) | 2.7% | 8.3% |
+| stack-overflow handling | 0.05% | 0.03% |
+
+- Calls: rkt-list makes 16.8M non-tail Scheme calls, 6.7M tail calls and 14.5M C calls
+  in ~0.3 s of user time; DrRacket startup 61.4M, 30.9M and 143M. Most C calls are
+  small helpers on the load path (in fib20, `S_fasl_uptrin` alone is called 1.49M
+  times, `S_set_code_obj` 406k, `pthread_getspecific` 162k), so fasl reading pays a C
+  call per field. Those helpers are inlining candidates.
+- The most-entered Scheme procedures in rkt-list are `accessor` (2.34M entries), `loop`
+  (1.55M), `stencil-vector-copy!` (850k), `hash-ref/none` (594k) and `hash-ref` (554k).
+- Mutex time comes mostly from the loader and collector taking the tc mutex for
+  every interned symbol (`S_intern_sc`, `S_intern3` 30%), every dirty-card update
+  (`S_dirty_set` 16%), and jitdump (25%), all uncontended in a single-threaded run.
+- Continuation switches (returns to a saved stack): ~30k in the 0.3 s list.rkt
+  compile, 284k in DrRacket startup.
+- Non-tail recursion is deep but rarely overflows: `create-the-variables` 1593 frames
+  deep and `merge-helper@integer-set.rkt:136` 842 in DrRacket, `map` 528 in rkt-list,
+  yet stack-overflow handling is under 0.1% of time.
+
+## Event-driven snapshots
+
+magic-trace's intended use is a small ring buffer that it snapshots when something
+interesting happens, so only the last few milliseconds are decoded. ChezScheme
+`perf-profiling` 9310551 makes that work from Scheme and Racket:
+
+- The kernel has `magic_trace_stop_indicator(start_tsc, arg)`, the empty function
+  that magic-trace snapshots on (`magic-trace run -trigger .`, run on the `racket` or
+  `scheme` executable itself, since magic-trace finds the symbol in the program it
+  launches). magic-trace reads both arguments as tagged OCaml ints.
+- Scheme calls it as `(foreign-procedure "(cs)magic_trace_snapshot" (unsigned-64
+  unsigned-64) void)`; `racket-perf/magic-trace.rkt` wraps that as `trace-snapshot!`
+  and `with-trace-threshold` (snapshot when a block takes at least N ms).
+- `CHEZ_MAGIC_TRACE_GC_MS=N` snapshots after any collection of at least N ms.
+- `CHEZ_JITDUMP_LAZY=1` records no code while the program runs. The first snapshot
+  (every snapshot, with `=all`, for `-multi-snapshot`) waits
+  `CHEZ_MAGIC_TRACE_DELAY_MS` (default 100) for magic-trace to save the buffer, then
+  writes load records for all live code. Names are right unless a collection moved
+  code inside the window.
+- `mt-chez.sh` runs the program directly when its flags include `-trigger`.
+
+Results on huor (P-core 2, 512 KB buffer, magic-trace Chez mode):
+
+- **Slow compile.** Compiling string.rkt, list.rkt and format.rkt with a 200 ms
+  threshold snapshots right after the slow compile, with full Scheme stacks:
+  24835 non-tail calls, max depth 35, 42 resyncs and 21 decode errors, names as in
+  full-jitdump runs. Recording plus decoding takes 6.0 s. The first snapshot costs
+  about 145 ms (the delay and the code walk); later calls cost nothing. magic-trace
+  records the region start (242 ms earlier) on the hit, but draws it as a span only
+  when the start lies inside the snapshot window.
+- **Slow GC.** DrRacket startup with `CHEZ_MAGIC_TRACE_GC_MS=150` and
+  `-multi-snapshot` took 5 snapshots, all decoded. Each holds only the last
+  ~0.2 ms of the collection (the dirty-card phase, `S_dirty_set` and its mutex):
+  GC code is dense in branches, so 512 KB covers very little of it. Seeing a whole
+  long GC needs a bigger buffer (root, or a higher `kernel.perf_event_mlock_kb`).
+- **Cost when no snapshot is taken.** DrRacket startup, 5 alternating rounds: jitdump
+  off 11.22 G cycles (median), lazy jitdump on 11.23 G, the same instructions and
+  task-clock within noise, and the dump stays at its header.
+
+### Finding: GC rendezvous stalls come from bulk primitives
+
+`CHEZ_GC_RENDEZVOUS_LOG=1` prints, for each collection, the time from the collect
+request to the collection's start: how long the requesting thread waited for every
+other thread to reach a safe point. `CHEZ_MAGIC_TRACE_RENDEZVOUS_MS=N` snapshots
+(arg 1) when that wait is at least N ms, and `CHEZ_MAGIC_TRACE_RENDEZVOUS_SKIP=K`
+skips the first K such waits. Every process waits 2.6 to 4 ms at its first
+collection, which is requested during boot and served at the post-boot compaction.
+Survey on huor, P-cores 0-2, 3 runs each:
+
+| Workload | Median wait | Waits of 1 ms or more |
+|---|---|---|
+| `raco make -j 3`, fresh expander copy (220 .zo) | 0.015 ms (p99 0.15) | only the boot wait |
+| 3 allocating places / 3 allocating futures | 0.008 / 0.005 ms | none |
+| allocating place + place in a non-allocating flonum loop | 0.007 ms | none |
+| allocating place + place doing 64 MB `bytes-copy!` | 1.9 ms | almost all; ~760 ms of a 3 s run; two of 22-25 ms per run |
+| allocating place + place doing `sort` of a 1M list | 0.01 ms | 11% of collections, ~3.7 ms |
+| DrRacket startup | 0.01 ms | 3 per run, max 4-7 ms |
+
+The traces of the outliers (`-multi-thread -trigger .`) show:
+
+- The 22-25 ms waits are 64 MB `make-bytes`: the fill runs with no event check and
+  is mostly page faults on fresh memory.
+- The `sort` waits are its 1M-element scratch `make-vector`, the same kind of
+  uninterruptible fill, 5.7 ms for one.
+- The steady 1.9 ms is `bytes-copy!`, 3.3 ms per 64 MB copy, so a collection waits
+  about half a copy. This one is inferred from timing; the snapshot window does not
+  hold the memcpy itself.
+- DrRacket's 7 ms is single-threaded: `faslin` reading code with interrupts
+  disabled under `instantiate-linklet`; the collection runs at `enable-interrupts`.
+
+Ordinary code, places, futures and parallel `raco make` reach safe points within
+microseconds. The cost is bulk fills and copies that run with no event check,
+which stall every other place's collection for their full duration. Fills and
+copies that checked for events every few MB would cap a wait at about 1 ms.
+
+magic-trace's `-trigger` breakpoint fires only on the main OS thread (the kernel
+will not map the buffer of an inherited breakpoint), so at first no snapshot was
+taken when a place's thread ran the collection. Since `perf-profiling` 9310551,
+a snapshot from another thread signals the main thread (SIGRTMIN+6), whose handler
+makes the call, and waits up to 50 ms.
 
 ## Recommendations
 
@@ -371,17 +594,21 @@ added here.
 2. Use PT through magic-trace's Chez mode for questions the sampler cannot answer:
    exact call counts and sequences, per-call and per-GC latency, what happens in one
    slow operation. Run it on a P-core, `noretcomp`, with perf on its own core:
-   - snapshot mode (`magic-trace run`, or attach with `-p` and Ctrl-C) for the last
-     ~2 ms before an event; decoding takes seconds;
+   - snapshot mode (`magic-trace run -trigger .` with `with-trace-threshold`,
+     `trace-snapshot!` or `CHEZ_MAGIC_TRACE_GC_MS`, plus `CHEZ_JITDUMP_LAZY=1`; or
+     attach with `-p` and Ctrl-C) for the last ~2 ms before an event; decoding takes
+     seconds;
    - full execution only for runs under about a second, and expect ~25 minutes of
      decode per traced second and 3-10% of the trace lost.
-3. Ship the jitdump changes (done: `perf-profiling` 840b1a2d). jitdump is cheap enough
-   to leave on whenever profiling (10-20 ms at startup, no measurable steady-state
-   cost) and also names code for ordinary `perf record`.
+3. Ship the jitdump changes (`perf-profiling` 39c32ef). Move records cut DrRacket's
+   dump from 608 MB to 152 MB and the extra instructions from +6.1% to +2.4%, but it
+   still costs +5-6% user cycles on code-heavy Racket runs, so leave it opt-in. For PT,
+   and with perf 7.0 (a perf bug), use `CHEZ_JITDUMP_NO_MOVES=1`; for sampling with
+   perf 7.0, `jitdump_expand_moves.py` also works.
+   On the Chez compiler bench it costs nothing measurable.
 4. Worth doing next, in order of value:
-   - a trigger that does not need an ELF symbol (e.g. have Chez call a tiny C marker
-     function, or use `Magic_trace.take_snapshot`'s protocol), so a Scheme event can
-     end a snapshot;
+   - (done: 9310551, see Event-driven snapshots) a trigger from Scheme events, with
+     a lazy jitdump that costs nothing until a snapshot;
    - magic-trace (or perf) parallel decoding, since decode time is the limit; perf
      can decode separate AUX ranges independently;
    - clear the stack on `exec` (stacks now start with the frames of the `taskset` that
@@ -394,7 +621,7 @@ added here.
 ## Files
 
 - Patches: magic-trace diff `pt/magic-trace-chez.diff` (samth/racket-cs-gdb `pt-stacks`),
-  Chez jitdump: samth/ChezScheme `perf-profiling`.
+  Chez jitdump: samth/ChezScheme `perf-profiling` (39c32ef, with move records).
 - Scripts: `pt-record.sh`, `pt-decode.sh`, `mt-decode.sh`, `mt-chez.sh`, `overhead.sh`,
   `pt-matrix.sh`, `ptstack/chez_pt_stacks.py`, `ptstack/compare_folded.py`, `ptstack/flame.py`.
 - Folded stacks per workload and tool: `pt/eval/folded/` (and /tmp/mtrace/eval on huor).

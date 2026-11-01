@@ -9,7 +9,9 @@ extra=()
 while [ "$1" != -- ]; do extra+=("$1"); shift; done
 shift
 mkdir -p "$out/jit"
-CHEZ_JITDUMP="$out/jit" CHEZ_JITDUMP_TSC=1 \
+# full load records for moved code: PT decoding needs the bytes as they are after
+# the move (direct calls and jumps are rel32), which move records do not carry
+CHEZ_JITDUMP="$out/jit" CHEZ_JITDUMP_TSC=1 CHEZ_JITDUMP_NO_MOVES=1 \
   perf record -m 8,512K -e intel_pt/noretcomp/u -o "$out/pt.data" -- "$@" < /dev/null
 perf inject --jit -i "$out/pt.data" -o "$out/pt.jit.data"
 perf script -i "$out/pt.jit.data" --itrace=b --ns -F time,flags,ip,addr,insnlen,sym,symoff,dso 2> "$out/script.err" \

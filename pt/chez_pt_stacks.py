@@ -67,9 +67,12 @@ def is_frame_return(b, o, n):
     return n == 4 and b[o:o + 4] == b'\x41\xff\x65\x00'
 
 
-def call_return_address(b, o, entry):
+def call_return_address(b, o, entry, load_addr):
     """If the jmp at offset o follows `lea ret(%rip),%reg; mov %reg,0(%r13)`, return
-    (ret, mvret) as absolute addresses; mvret is the word in the return point's header."""
+    (ret, mvret) as absolute addresses for code now at entry; mvret is the word in the
+    return point's header, which holds an absolute address as of load_addr (the
+    jitdump's load record), so it is rebased for code the collector has moved since
+    (a jitdump move record maps the same code bytes at a new address)."""
     lo = max(0, o - 40)
     for p in range(o - 7, lo - 1, -1):
         rex, op, modrm = b[p], b[p + 1], b[p + 2]
@@ -86,6 +89,8 @@ def call_return_address(b, o, entry):
                     sreg = ((mmod >> 3) & 7) | (8 if mrex == 0x4d else 0)
                     if sreg == reg:
                         mv = struct.unpack_from('<Q', b, target - 0x20)[0] if target >= 0x20 else None
+                        if mv is not None:
+                            mv = mv - load_addr + entry
                         return entry + target, mv
             return None
     return None
@@ -207,14 +212,16 @@ def main():
                 stats['returns matched' if sj and is_frame_return(code[int(sj.group(1))][1], soff, ilen)
                       else 'returns matched (other jmp)'] += 1
             elif sj and soff is not None and int(sj.group(1)) in code:
-                entry, b, _ = code[int(sj.group(1))]
+                load_addr, b, _ = code[int(sj.group(1))]
+                # where the code is now: it may have moved since its load record
+                entry = src - soff
                 if is_frame_return(b, soff, ilen):
                     stats['returns unmatched (resync)'] += 1
                     if len(stack) > 1:
                         pop(t)
                     replace_top(dsym, t)
                 else:
-                    ret = call_return_address(b, soff, entry)
+                    ret = call_return_address(b, soff, entry, load_addr)
                     if ret is not None:
                         push(dsym, ret[0], 's', t, ret[1])
                         stats['non-tail calls'] += 1
