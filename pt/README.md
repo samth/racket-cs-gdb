@@ -16,8 +16,17 @@ Files:
 - `magic-trace-chez.diff`: magic-trace patch (against tag v1.2.4) with a Chez mode;
   see below.
 - `mt-chez.sh`: runs patched magic-trace in Chez mode with the traced program on one core.
+- `pt-record.sh`, `pt-decode.sh`, `mt-decode.sh`: record a full trace (program and perf
+  on separate cores) in magic-trace's working-directory layout, then decode it with
+  magic-trace's Chez mode and with `chez_pt_stacks.py`.
+- `overhead.sh`, `overhead-full.sh`, `pt-matrix.sh`: the overhead and PT-settings
+  measurements in EVAL.md.
 - `compare_folded.py`: compares two folded profiles (self and inclusive shares per
   procedure, overlap score); used to check PT stacks against the in-process sampler.
+- `prune_folded.py`, `flame.py`: shrink folded files; fold perf callchains and render
+  a quick SVG flame graph without external tools.
+- `eval/`: the workloads, and `eval/folded/` the folded stacks behind EVAL.md
+  (workload-tool.folded.gz; tools: magic-trace-chez, chez-pt, perf-itrace, sampler).
 - `EVAL.md`: the evaluation (method, numbers, recommendations).
 - `REPORT-2026-10-31.md`: earlier notes (frame-chain overhead, first PT experiments).
 
@@ -45,6 +54,15 @@ that `perf inject --jit` created:
 - tail call: any other jump to a code object's entry renames the top frame;
 - C: real `call`s push with return address ip+ilen; real `ret`s pop to the matching
   frame, or rename the top when none matches.
+
+magic-trace's Chez mode adds two rules that `chez_pt_stacks.py` lacks:
+
+- it remembers, for each return address, the stack as it was when a frame waiting for
+  that address was pushed; an indirect `jmp` or C `ret` to such an address that no
+  current frame waits for switches to that stack. Racket's engine swaps and
+  continuations do this constantly, and stacks damaged by decode errors recover;
+- decode errors keep the stack (stock magic-trace clears it, which truncates every
+  later stack); `MAGIC_TRACE_CHEZ_CLEAR_STACK_ON_ERROR=1` restores the old behavior.
 
 Record with `intel_pt/noretcomp/u`: Scheme code enters and leaves C without
 balanced call/ret, which breaks perf's return-compression bookkeeping.
@@ -81,9 +99,14 @@ CHEZ_JITDUMP=$PWD/jit CHEZ_JITDUMP_TSC=1 \
 `MAGIC_TRACE_CHEZ=1` adds `noretcomp=1` to the PT event, runs `perf inject --jit`
 before decoding, disables the same-symbol-jump dlfilter (it would drop recursive
 returns), records `insnlen`, and reclassifies jumps as above.
-`MAGIC_TRACE_CHEZ_FOLDED` also writes folded stacks. At the end it prints counts of
-each classification, the top Scheme entries, the deepest self-recursion per
-procedure and a depth histogram.
+`MAGIC_TRACE_CHEZ_FOLDED` also writes folded stacks (weighted by trace time; kernel
+time appears as `[untraced]`/`[syscall]` leaves). At the end it prints counts of each
+classification, the top Scheme entries, the deepest self-recursion per procedure and a
+depth histogram.
+
+The patch also fixes three problems in stock magic-trace with perf 7: it cannot parse
+`tr end  jmp` lines; the .fxt writer crashes when a stack's reset time runs a few ns
+past the event that uses it; and `decode` decodes `perf inject`'s `*.old` file again.
 
 Unprivileged users are limited by `perf_event_mlock_kb` (516 KB by default) to a
 512K AUX buffer; see EVAL.md for which PT settings and cores keep data loss low.

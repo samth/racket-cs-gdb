@@ -56,10 +56,10 @@ def split_sym(s):
 
 
 class Frame:
-    __slots__ = ('name', 'ret', 'mvret', 'kind')
+    __slots__ = ('name', 'ret', 'mvret', 'kind', 'start')
 
-    def __init__(self, name, ret, kind, mvret=None):
-        self.name, self.ret, self.kind, self.mvret = name, ret, kind, mvret
+    def __init__(self, name, ret, kind, mvret=None, start=None):
+        self.name, self.ret, self.kind, self.mvret, self.start = name, ret, kind, mvret, start
 
 
 def is_frame_return(b, o, n):
@@ -101,6 +101,7 @@ def main():
     ap.add_argument('--chrome-start', help='start the Chrome trace when this procedure is first entered')
     ap.add_argument('--root', default='<root>')
     ap.add_argument('--log-depth', type=int, help='when depth first exceeds this, print the preceding classified events')
+    ap.add_argument('--durations', help='comma-separated procedure names: report the duration of each activation')
     args = ap.parse_args()
 
     code = read_jitdump(args.jitdump)
@@ -115,6 +116,8 @@ def main():
     chrome = []
     chrome_full = False
     chrome_on = not args.chrome_start
+    dur_names = set(args.durations.split(',')) if args.durations else set()
+    durations = collections.defaultdict(list)
 
     def emit(ph, name, t):
         nonlocal chrome_full
@@ -129,11 +132,13 @@ def main():
             chrome_on = True
             for f in stack:
                 emit('B', f.name, t)
-        stack.append(Frame(name, ret, kind, mvret))
+        stack.append(Frame(name, ret, kind, mvret, t if name in dur_names else None))
         emit('B', name, t)
 
     def pop(t):
         f = stack.pop()
+        if f.start is not None:
+            durations[f.name].append(t - f.start)
         emit('E', f.name, t)
 
     def replace_top(name, t):
@@ -141,8 +146,11 @@ def main():
             push(name, None, 'unknown', t)
         elif stack[-1].name != name:
             f = stack[-1]
+            if f.start is not None:
+                durations[f.name].append(t - f.start)
             emit('E', f.name, t)
             f.name = name
+            f.start = t if name in dur_names else None
             emit('B', name, t)
 
     def pop_to(ret, t):
@@ -254,6 +262,11 @@ def main():
         with open(args.chrome, 'w') as f:
             json.dump({'traceEvents': chrome, 'displayTimeUnit': 'ns'}, f)
 
+    for name in sorted(durations):
+        d = sorted(durations[name])
+        q = lambda p: d[min(len(d) - 1, int(p * len(d)))]
+        print('durations %s: n=%d total=%.3fms min=%dns median=%dns p90=%dns p99=%dns max=%dns' %
+              (name, len(d), sum(d) / 1e6, d[0], q(0.5), q(0.9), q(0.99), d[-1]))
     print('max Scheme-event depth', max_depth)
     for k, v in sorted(stats.items()):
         print('%-32s %d' % (k, v))

@@ -1,9 +1,9 @@
 diff --git a/src/chez_mode.ml b/src/chez_mode.ml
 new file mode 100644
-index 0000000..d35ed2f
+index 0000000..7bf7808
 --- /dev/null
 +++ b/src/chez_mode.ml
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,581 @@
 +open! Core
 +
 +(* Chez Scheme (and so Racket CS) calls and returns with [jmp]s on x86_64:
@@ -92,6 +92,10 @@ index 0000000..d35ed2f
 +    { mutable stack : Frame.t list
 +    ; mutable depth : int
 +    ; mutable last_time : Time_ns.Span.t option
++    ; mutable tracing_stopped : bool (* saw a trace end, so the next start resumes it *)
++    ; saved : (int64, Frame.t list) Hashtbl.t
++        (* for each return address, the stack as it was when a frame waiting for it
++           was last pushed (that frame on top); lists share structure, so this is cheap *)
 +    }
 +end
 +
@@ -153,6 +157,13 @@ index 0000000..d35ed2f
 +  && byte data (off + o + 3) = 0x00
 +;;
 +
++(* [jmp *...]: an optional REX prefix, then FF /4 *)
++let is_indirect_jmp data off size o =
++  let b i = if o + i < size then byte data (off + o + i) else 0 in
++  let p = if b 0 land 0xf0 = 0x40 then 1 else 0 in
++  b p = 0xff && (b (p + 1) lsr 3) land 7 = 4
++;;
++
 +(* If the jmp at code offset [o] follows [lea ret(%rip),%reg; mov %reg,0x0(%r13)],
 +   the return address and the mv-return address in the return point's header. *)
 +let call_return_address data off size addr o =
@@ -201,7 +212,8 @@ index 0000000..d35ed2f
 +
 +let thread_state t thread =
 +  Hashtbl.find_or_add t.threads thread ~default:(fun () ->
-+    { Thread_state.stack = []; depth = 0; last_time = None })
++    { Thread_state.stack = []; depth = 0; last_time = None; tracing_stopped = false
++    ; saved = Hashtbl.create (module Int64) })
 +;;
 +
 +let name_of (loc : Event.Location.t) =
@@ -238,7 +250,9 @@ index 0000000..d35ed2f
 +  let f = { Frame.loc; ret; mvret; path = path_on ts.stack loc; run = run_on ts.stack loc } in
 +  note_run f;
 +  ts.stack <- f :: ts.stack;
-+  ts.depth <- ts.depth + 1
++  ts.depth <- ts.depth + 1;
++  Option.iter ret ~f:(fun r -> Hashtbl.set ts.saved ~key:r ~data:ts.stack);
++  Option.iter mvret ~f:(fun r -> Hashtbl.set ts.saved ~key:r ~data:ts.stack)
 +;;
 +
 +let pop (ts : Thread_state.t) =
@@ -309,6 +323,63 @@ index 0000000..d35ed2f
 +  loop n []
 +;;
 +
++(* Jump to a return address that no frame on the current stack is waiting for,
++   but that a frame was waiting for earlier: a continuation being reinstated (Racket's
++   engine swaps and threads do this all the time), or a stack the trace lost track of.
++   Switch to the frames that were below that frame, sharing what the two stacks have
++   in common: [Return]s down to the common part, then [Call]s back up. *)
++let switch_stack t ok (ts : Thread_state.t) (target : Frame.t list) ~src ~(dst : Event.Location.t)
++  =
++  let lt = List.length target in
++  let rec drop l n = if n <= 0 then l else drop (List.tl_exn l) (n - 1) in
++  let rec common a b = if phys_equal a b then a else common (List.tl_exn a) (List.tl_exn b) in
++  let base =
++    let a = drop ts.stack (ts.depth - lt)
++    and b = drop target (lt - ts.depth) in
++    common a b
++  in
++  let lbase = List.length base in
++  let npop = ts.depth - lbase in
++  let to_push = List.rev (List.take target (lt - lbase)) (* bottom first *) in
++  let events = ref [] in
++  let emit e = events := e :: !events in
++  let to_push = ref to_push in
++  for _ = 1 to npop do
++    pop ts;
++    let exposed =
++      match ts.stack, !to_push with
++      | f :: _, _ -> f.loc
++      | [], f :: rest ->
++        (* the writer starts a new stack with this frame *)
++        to_push := rest;
++        ts.stack <- [ f ];
++        ts.depth <- 1;
++        f.loc
++      | [], [] -> dst
++    in
++    if List.is_empty ts.stack then check_symbol ts exposed;
++    emit (make ok Return ~src ~dst:exposed)
++  done;
++  List.iter !to_push ~f:(fun (f : Frame.t) ->
++    emit (make ok Call ~src ~dst:f.loc));
++  ts.stack <- target;
++  ts.depth <- lt;
++  Hashtbl.update t.stats "frames popped by stack switches" ~f:(fun v ->
++    Option.value v ~default:0 + npop);
++  Hashtbl.update t.stats "frames pushed by stack switches" ~f:(fun v ->
++    Option.value v ~default:0 + List.length !to_push);
++  check_symbol ts dst;
++  emit (make ok Jump ~src ~dst);
++  List.rev !events
++;;
++
++(* a jump to [dst] that matches no frame: switch to the stack saved for [dst], if any *)
++let switch_to_saved t ok (ts : Thread_state.t) ~src ~(dst : Event.Location.t) =
++  match Hashtbl.find ts.saved dst.instruction_pointer with
++  | Some (_ :: (_ :: _ as below)) -> Some (switch_stack t ok ts below ~src ~dst)
++  | _ -> None
++;;
++
 +let call t ok ts ?ret ?mvret ~src ~(dst : Event.Location.t) () =
 +  ignore t;
 +  push ts ?ret ?mvret dst;
@@ -340,15 +411,31 @@ index 0000000..d35ed2f
 +       count t "C returns matched";
 +       returns t ok ts n ~src ~dst
 +     | None ->
-+       count t "C returns unmatched (renamed top)";
-+       jump ok ts ~src ~dst)
++       (match switch_to_saved t ok ts ~src ~dst with
++        | Some events ->
++          count t "C returns to a saved stack";
++          events
++        | None ->
++          count t "C returns unmatched (renamed top)";
++          jump ok ts ~src ~dst))
 +  | _ ->
 +    (match frames_to dst_ip ts with
 +     | Some n ->
 +       count t "returns matched";
 +       returns t ok ts n ~src ~dst
 +     | None ->
-+       (match code_of t extra.src_dso with
++       let src_code = code_of t extra.src_dso in
++       let indirect =
++         match src_code with
++         | Some (data, _, off, size) -> is_indirect_jmp data off size src.symbol_offset
++         | None -> false
++       in
++       (match if indirect then switch_to_saved t ok ts ~src ~dst else None with
++        | Some events ->
++          count t "returns to a saved stack (continuation switch)";
++          events
++        | None ->
++       match src_code with
 +        | Some (data, addr, off, size) ->
 +          let o = src.symbol_offset in
 +          if is_frame_return data off size o extra.ilen
@@ -401,12 +488,25 @@ index 0000000..d35ed2f
 +  ts.last_time <- Some time
 +;;
 +
++let keep_stack_on_error = not Env_vars.chez_clear_stack_on_error
++
 +let process t (event : Event.t) (extra : Extra.t option) : Event.t list =
 +  match event with
 +  | Error err ->
-+    count t "decode errors (stack cleared)";
-+    Option.iter (Hashtbl.find t.threads err.thread) ~f:clear;
-+    [ event ]
++    if keep_stack_on_error
++    then (
++      (* After an overflow or a mismatch, the program carries on in the same frames,
++         and the return-address matching resynchronizes the stack, so keep it instead
++         of letting the writer drop it (which truncates every later stack). The next
++         trace start then just moves to where tracing resumed. *)
++      count t "decode errors (stack kept)";
++      Option.iter (Hashtbl.find t.threads err.thread) ~f:(fun ts ->
++        ts.tracing_stopped <- false);
++      [])
++    else (
++      count t "decode errors (stack cleared)";
++      Option.iter (Hashtbl.find t.threads err.thread) ~f:clear;
++      [ event ])
 +  | Ok ok ->
 +    let ts = thread_state t ok.thread in
 +    weigh t ts ok.time;
@@ -424,7 +524,16 @@ index 0000000..d35ed2f
 +            check_symbol ts dst;
 +            [ event ])
 +        else classify t ok ts extra kind ~src ~dst
++      | Trace { trace_state_change = Some Start; kind = _; src; dst }, _
++        when keep_stack_on_error && not ts.tracing_stopped ->
++        (* a start with no end before it: tracing resumed after a decode error *)
++        check_symbol ts dst;
++        [ make ok Jump ~src ~dst ]
 +      | data, _ ->
++        (match data with
++         | Trace { trace_state_change = Some End; _ } -> ts.tracing_stopped <- true
++         | Trace { trace_state_change = Some Start; _ } -> ts.tracing_stopped <- false
++         | _ -> ());
 +        mirror_passthrough ts data;
 +        [ event ]
 +    in
@@ -477,10 +586,10 @@ index 0000000..d35ed2f
 +  | _ -> ()
 +;;
 diff --git a/src/env_vars.ml b/src/env_vars.ml
-index 5157942..ee391f7 100644
+index 5157942..cb2bcc4 100644
 --- a/src/env_vars.ml
 +++ b/src/env_vars.ml
-@@ -47,3 +47,12 @@ let no_ocaml_exception_debug_info =
+@@ -47,3 +47,18 @@ let no_ocaml_exception_debug_info =
  let skip_transaction_handling =
    Option.is_some (Unix.getenv "MAGIC_TRACE_SKIP_TX_HANDLING")
  ;;
@@ -493,16 +602,23 @@ index 5157942..ee391f7 100644
 +(* In Chez mode, also write folded stacks (weighted by trace time in ns) to this
 +   file, for flame graphs and comparison with sampling profilers. *)
 +let chez_folded = Unix.getenv "MAGIC_TRACE_CHEZ_FOLDED"
++
++(* In Chez mode, keep the reconstructed stack across decode errors (the default),
++   unless this is set. *)
++let chez_clear_stack_on_error =
++  Option.is_some (Unix.getenv "MAGIC_TRACE_CHEZ_CLEAR_STACK_ON_ERROR")
++;;
 diff --git a/src/env_vars.mli b/src/env_vars.mli
-index b9348f4..6a879d4 100644
+index b9348f4..cc5a0a4 100644
 --- a/src/env_vars.mli
 +++ b/src/env_vars.mli
-@@ -10,3 +10,5 @@ val no_dlfilter : bool
+@@ -10,3 +10,6 @@ val no_dlfilter : bool
  val fzf_demangle_symbols : bool
  val no_ocaml_exception_debug_info : bool
  val skip_transaction_handling : bool
 +val chez : bool
 +val chez_folded : string option
++val chez_clear_stack_on_error : bool
 diff --git a/src/perf_decode.ml b/src/perf_decode.ml
 index 28480f4..c6e5481 100644
 --- a/src/perf_decode.ml
@@ -602,7 +718,7 @@ index 28480f4..c6e5481 100644
  
  let%test_module _ =
 diff --git a/src/perf_tool_backend.ml b/src/perf_tool_backend.ml
-index ce10634..b1f537e 100644
+index ce10634..a9d6412 100644
 --- a/src/perf_tool_backend.ml
 +++ b/src/perf_tool_backend.ml
 @@ -188,6 +188,13 @@ module Recording = struct
@@ -628,14 +744,15 @@ index ce10634..b1f537e 100644
      with
      | true, Intel_processor_trace _, false ->
        let filename = record_dir ^/ "perf_dlfilter.so" in
-@@ -487,7 +494,28 @@ let decode_events
+@@ -487,7 +494,29 @@ let decode_events
    let%bind files =
      Sys.readdir record_dir
      >>| Array.to_list
 -    >>| List.filter ~f:(String.is_prefix ~prefix:"perf.data")
 +    >>| List.filter ~f:(fun file ->
 +      String.is_prefix file ~prefix:"perf.data"
-+      && not (String.is_suffix file ~suffix:".chez-jit"))
++      (* [perf inject -o] renames an existing output to *.old *)
++      && not (String.is_substring file ~substring:".chez-jit"))
 +  in
 +  let%bind files =
 +    if not Env_vars.chez
@@ -658,7 +775,7 @@ index ce10634..b1f537e 100644
    in
    let%map result =
      Deferred.List.map files ~how:`Sequential ~f:(fun perf_data_file ->
-@@ -499,7 +527,10 @@ let decode_events
+@@ -499,7 +528,10 @@ let decode_events
        let fields_opts =
          match collection_mode with
          | Intel_processor_trace _ ->

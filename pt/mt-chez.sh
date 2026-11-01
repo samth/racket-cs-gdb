@@ -13,7 +13,7 @@ out=$(cd "$out" && pwd)
 start=$(date +%s.%N)
 MAGIC_TRACE_CHEZ=1 MAGIC_TRACE_CHEZ_FOLDED="$out/stacks.folded" \
 CHEZ_JITDUMP="$out/jit" CHEZ_JITDUMP_TSC=1 \
-  taskset -c 8-19 /tmp/mtrace/bin/magic-trace run -working-directory "$out/wd" \
+  taskset -c ${PERFCPUS:-8-19} ${MT:-/tmp/mtrace/bin/magic-trace-v4} run -working-directory "$out/wd" \
     "${flags[@]}" -o "$out/trace.fxt" -- taskset -c "$core" "$@" > "$out/run.log" 2>&1 < /dev/null
 rc=$?
 end=$(date +%s.%N)
